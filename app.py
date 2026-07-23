@@ -7,7 +7,7 @@ from collections import defaultdict
 st.set_page_config(page_title="MCA Bank Parser & Underwriting Tool", page_icon="💳", layout="wide")
 
 st.title("💳 MCA Statement Analyzer & Underwriting Engine")
-st.caption("Upload bank statements (individual or merged). The engine isolates true revenue, ignores running balances, and calculates MCA positions.")
+st.caption("Upload bank statements (individual or merged). The engine isolates true revenue via transaction blocking, ignores running balances, and calculates MCA positions.")
 st.divider()
 
 # --- LENDER DICTIONARY WITH ALIASES & TIERS ---
@@ -43,22 +43,18 @@ KNOWN_FUNDERS = {
 
 # --- PARSING FILTERS & REGEX ---
 MONTH_MAP = {"01": "Jan", "02": "Feb", "03": "Mar", "04": "Apr", "05": "May", "06": "Jun", 
-             "07": "Jul", "08": "Aug", "09": "Sep", "10": "Oct", "11": "Nov", "12": "Dec",
-             "JAN": "Jan", "FEB": "Feb", "MAR": "Mar", "APR": "Apr", "MAY": "May", "JUN": "Jun",
-             "JUL": "Jul", "AUG": "Aug", "SEP": "Sep", "OCT": "Oct", "NOV": "Nov", "DEC": "Dec"}
+             "07": "Jul", "08": "Aug", "09": "Sep", "10": "Oct", "11": "Nov", "12": "Dec"}
 
 NSF_KEYWORDS = ["NSF FEE", "NSF CHARGE", "NON-SUFFICIENT FEE", "OVERDRAFT FEE", "RETURNED ITEM FEE"]
 
-# Strict exclusions for True Revenue (Internal Transfers, Loans, Refunds, Account Owner Names)
+# Strict exclusions for True Revenue
 REVENUE_EXCLUSIONS = [
     "INTERNAL TRANSFER", "TRANSFER FROM", "TRSF FROM", "MEMO TRANSFER", "ACCOUNT TRANSFER", 
     "LOAN", "BDC HASCAP", "LINE OF CREDIT", "LOC DRAW", "CASH ADVANCE", "ADVANCE PROCEEDS", 
     "REVERSAL", "REFUND", "RETURNED", "RTN WIRE", "PAYROLL", "UNITED TRADING"
 ]
-# Add all MCA keywords to exclusions so funding deposits aren't counted as organic revenue
 for f_data in KNOWN_FUNDERS.values():
     REVENUE_EXCLUSIONS.extend(f_data["keywords"])
-
 
 # --- SECTION 1: BANK STATEMENT PDF UPLOADER ---
 st.subheader("1. Bank Statement Ingestion & Month-by-Month Analysis")
@@ -78,91 +74,79 @@ mca_tracker = defaultdict(lambda: {"total_amount": 0.0, "debit_count": 0})
 if uploaded_files:
     st.info("📁 **Processing Documents...** Extracting summaries and calculating line-by-line true revenue.")
     
-    current_month_label = "Unknown"
-    
     for pdf_file in uploaded_files:
         with pdfplumber.open(pdf_file) as pdf:
+            transactions = []
+            current_tx = ""
+            
+            # 1. Block transactions by Date to prevent bleed-over
             for page in pdf.pages:
                 text = page.extract_text()
-                if not text:
-                    continue
+                if not text: continue
                 
                 lines = text.split("\n")
-                recent_lines = [] # Rolling buffer to catch multi-line transaction descriptions
-                
                 for line in lines:
-                    line_upper = line.upper().strip()
-                    if not line_upper: continue
+                    line_clean = line.strip()
+                    if not line_clean: continue
                     
-                    # Keep a rolling window of the last 3 lines for context
-                    recent_lines.append(line_upper)
-                    if len(recent_lines) > 3:
-                        recent_lines.pop(0)
-                        
-                    context_text = " ".join(recent_lines)
-                    
-                    # 1. Detect active month from transaction dates (e.g. 04/15 or Apr 15)
-                    date_match = re.search(r"^\s*(?:(\d{2})/\d{2}|(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC))\b", line_upper)
-                    if date_match:
-                        matched_val = date_match.group(1) if date_match.group(1) else date_match.group(2)
-                        if matched_val in MONTH_MAP:
-                            current_month_label = MONTH_MAP[matched_val]
+                    # Match Scotiabank Date Format: MM/DD/YYYY
+                    if re.match(r"^\d{2}/\d{2}/\d{4}", line_clean):
+                        if current_tx:
+                            transactions.append(current_tx)
+                        current_tx = line_clean
+                    elif current_tx:
+                        current_tx += " " + line_clean
+            
+            if current_tx:
+                transactions.append(current_tx)
 
-                    # 2. Extract Dollar Amounts (Handles commas, and captures numbers with OR without decimals)
-                    raw_amounts = re.findall(r"(?<!\S)(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)(?!\S)", line_upper)
-                    if not raw_amounts:
-                        continue
-                    
-                    # Convert found amounts to floats
-                    amounts = [float(a.replace(",", "")) for a in raw_amounts]
-                    
-                    # The first amount on the line is the transaction. The last is usually the balance.
+            # 2. Process each transaction block independently
+            for tx in transactions:
+                tx_upper = tx.upper()
+                
+                # Identify Month
+                month_str = tx[:2]
+                month_label = MONTH_MAP.get(month_str, "Unknown")
+                if month_label == "Unknown": continue
+
+                # Extract Dollar Amounts (Grabs amounts with or without decimals)
+                raw_amounts = re.findall(r"(?<!\S)(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)(?!\S)", tx_upper)
+                amounts = [float(a.replace(",", "")) for a in raw_amounts]
+                
+                if len(amounts) >= 2:
+                    # In Scotiabank layout, the transaction is second to last, balance is last.
+                    primary_amount = amounts[-2]
+                elif len(amounts) == 1:
                     primary_amount = amounts[0]
+                else:
+                    continue
 
-                    # 3. Explicitly ignore Bank Summary headers and balances
-                    if any(excl in context_text for excl in ["BEGINNING BALANCE", "ENDING BALANCE", "OPENING BALANCE", "CLOSING BALANCE", "TOTAL DEPOSITS", "TOTAL CREDITS", "TOTAL DEBITS", "TOTAL WITHDRAWALS"]):
-                        recent_lines = [] # Clear context buffer
-                        continue
+                # Classify transaction type
+                is_credit = any(kw in tx_upper for kw in ["CREDIT", "DEPOSIT", "INCOMING"])
+                is_debit = any(kw in tx_upper for kw in ["DEBIT", "PAYMENT", "PAD", "WITHDRAWAL", "FEE", "OUTGOING", "CHQ", "CHEQUE", "SERVICE CHARGE"])
+                
+                # E-Transfers fallback
+                if "INTERAC E-TRANSFER" in tx_upper and not is_debit:
+                    is_credit = True
 
-                    # 4. Classify as Debit or Credit based on Bank Verbiage
-                    is_debit = any(kw in context_text for kw in ["PAD", "PAYMENT", "DEBIT", "WITHDRAWAL", "FEE", "OUTGOING", "SERVICE CHARGE", "CHQ", "CHEQUE"])
-                    is_credit = any(kw in context_text for kw in ["CREDIT", "DEPOSIT", "INCOMING", "E-TRANSFER", "PAYABLE", "RTN WIRE"])
-                    
-                    # Fallback classification for E-Transfers (can be both, but usually credits if not specified as debit)
-                    if "INTERAC E-TRANSFER" in context_text and not is_debit:
-                        is_credit = True
-
-                    # 5. Process Transaction
-                    if is_debit:
-                        # NSF Tracking
-                        if any(kw in context_text for kw in NSF_KEYWORDS):
-                            monthly_data_store[current_month_label]["NSF Count"] += 1
-                            total_nsf_count += 1
+                if is_debit:
+                    if any(kw in tx_upper for kw in NSF_KEYWORDS):
+                        monthly_data_store[month_label]["NSF Count"] += 1
+                        total_nsf_count += 1
+                        
+                    for lender_name, meta in KNOWN_FUNDERS.items():
+                        if any(kw in tx_upper for kw in meta["keywords"]):
+                            if "restrict_freq" in meta and "MONTHLY" in tx_upper:
+                                continue
+                            mca_tracker[lender_name]["total_amount"] += primary_amount
+                            mca_tracker[lender_name]["debit_count"] += 1
+                            break 
                             
-                        # MCA Debit Tracking
-                        for lender_name, meta in KNOWN_FUNDERS.items():
-                            if any(kw in context_text for kw in meta["keywords"]):
-                                if "restrict_freq" in meta and "MONTHLY" in context_text:
-                                    continue
-                                mca_tracker[lender_name]["total_amount"] += primary_amount
-                                mca_tracker[lender_name]["debit_count"] += 1
-                                break # Stop searching once lender is found
-                                
-                    elif is_credit:
-                        # True Revenue Calculation (Ensure it doesn't contain exclusions like loans/MCA)
-                        if not any(excl in context_text for excl in REVENUE_EXCLUSIONS):
-                            monthly_data_store[current_month_label]["True Revenue"] += primary_amount
-                            
-                    # Clear context buffer after successfully processing a transaction line
-                    recent_lines = []
-
-    # Clean up any stray data processed before the first month was detected
-    if "Unknown" in monthly_data_store and len(monthly_data_store) > 1:
-        del monthly_data_store["Unknown"]
+                elif is_credit:
+                    if not any(excl in tx_upper for excl in REVENUE_EXCLUSIONS):
+                        monthly_data_store[month_label]["True Revenue"] += primary_amount
 
     num_active_months = max(1, len(monthly_data_store))
-
-    # Compile Final Chart Data
     chart_data = []
     total_true_revenue = 0.0
     
@@ -178,11 +162,9 @@ if uploaded_files:
     auto_monthly_revenue = total_true_revenue / num_active_months
     avg_nsf_per_month = total_nsf_count / num_active_months
 
-    # Process MCA Positions (Determine Frequency via Math)
+    # Process MCA Positions (Frequency via Math)
     for lender, data in mca_tracker.items():
         avg_debits_per_month = data["debit_count"] / num_active_months
-        
-        # If they debit roughly 20-22 times a month, it's Daily. If 4-5, it's Weekly.
         freq = "Daily" if avg_debits_per_month > 8 else "Weekly"
         divisor = 21.67 if freq == "Daily" else 4.33
         
@@ -196,7 +178,6 @@ if uploaded_files:
             "monthly_avg": round(avg_monthly_impact, 2)
         })
 
-    # Display Month-by-Month Statement Breakdown Table
     st.markdown("### 📊 Extracted Financial Chart")
     st.dataframe(
         df_breakdown.style.format({
@@ -205,9 +186,8 @@ if uploaded_files:
         use_container_width=True, hide_index=True
     )
 
-    # Display Summary Headers
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Months Detected", f"{num_active_months} Months")
+    m1.metric("Distinct Months", f"{num_active_months} Months")
     m2.metric("Avg True Monthly Revenue", f"${auto_monthly_revenue:,.2f}")
     m3.metric("NSF Fees (Total / Avg)", f"{total_nsf_count} Total", f"{avg_nsf_per_month:.1f} / mo", delta_color="inverse" if total_nsf_count > 0 else "normal")
     m4.metric("Detected MCA Positions", f"{len(detected_funder_positions)} Funder(s)")
@@ -230,17 +210,21 @@ with col_left:
     st.markdown("#### Detected Debt Positions")
     st.caption("Funder, frequency, and payment amount dynamically calculated from statement history.")
 
-    if "positions" not in st.session_state:
-        st.session_state.positions = [{"name": "Existing Funder #1", "amount": 150.0, "freq": "Daily"}]
-
-    if detected_funder_positions and (len(st.session_state.positions) == 1 and st.session_state.positions[0]["name"] == "Existing Funder #1"):
-        st.session_state.positions = []
-        for funder in detected_funder_positions:
-            st.session_state.positions.append({
-                "name": funder["name"],
-                "amount": funder["amount"],
-                "freq": funder["freq"]
-            })
+    # Forced session state override on new document upload
+    if "upload_count" not in st.session_state or (uploaded_files and st.session_state.upload_count != len(uploaded_files)):
+        if detected_funder_positions:
+            st.session_state.positions = []
+            for funder in detected_funder_positions:
+                st.session_state.positions.append({
+                    "name": funder["name"],
+                    "amount": funder["amount"],
+                    "freq": funder["freq"]
+                })
+        else:
+            st.session_state.positions = [{"name": "Existing Funder #1", "amount": 150.0, "freq": "Daily"}]
+        
+        if uploaded_files:
+            st.session_state.upload_count = len(uploaded_files)
 
     total_existing_monthly_debt = 0.0
     num_positions = len(st.session_state.positions)
@@ -312,7 +296,6 @@ existing_dsr = (total_existing_monthly_debt / avg_monthly_rev) if avg_monthly_re
 risk_reasons = []
 risk_multiplier = 1.0
 
-# NSF Penalty Audit based on average per month
 if 'avg_nsf_per_month' in locals():
     if avg_nsf_per_month > 3.0:
         risk_multiplier *= 0.70
@@ -323,7 +306,6 @@ if 'avg_nsf_per_month' in locals():
     else:
         risk_reasons.append(f"NSF Fee Risk: Clean Record ({total_nsf_count} total fees, {avg_nsf_per_month:.1f}/mo — No penalty)")
 
-# Credit Score Audit
 if credit_score < 580:
     risk_multiplier *= 0.65
     risk_reasons.append(f"Credit Score: {credit_score} (Sub-580 FICO — 35% penalty)")
@@ -333,7 +315,6 @@ elif credit_score < 650:
 else:
     risk_reasons.append(f"Credit Score: {credit_score} (Prime FICO — No penalty)")
 
-# Time in Business Audit
 if tib_months < 12:
     risk_multiplier *= 0.70
     risk_reasons.append(f"Time in Business: {tib_months}m (<1 Year — 30% penalty)")
@@ -343,20 +324,17 @@ elif tib_months < 24:
 else:
     risk_reasons.append(f"Time in Business: {tib_months}m (>2 Years — No penalty)")
 
-# Industry Audit
 if "High Risk" in industry_type:
     risk_multiplier *= 0.80
     risk_reasons.append("Industry: High Risk Sector — 20% penalty")
 else:
     risk_reasons.append("Industry: Standard Risk Sector — No penalty")
 
-# Bankruptcy Audit
 if has_bk_collections:
     risk_reasons.append("Bankruptcy / Collections: ACTIVE ON RECORD (Hard Decline)")
 else:
     risk_reasons.append("Bankruptcy / Collections: Clean Record")
 
-# Stacking Position Penalties
 position_penalty = 1.0
 if num_positions == 2:
     position_penalty = 0.85
