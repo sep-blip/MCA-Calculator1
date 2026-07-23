@@ -1,3 +1,4 @@
+Python
 import streamlit as st
 import pdfplumber
 import pandas as pd
@@ -7,7 +8,7 @@ from collections import defaultdict
 st.set_page_config(page_title="MCA Bank Parser & Underwriting Tool", page_icon="💳", layout="wide")
 
 st.title("💳 MCA Statement Analyzer & Underwriting Engine")
-st.caption("Upload bank statements to group transactions, separate total deposits from true revenue, isolate MCA positions, and calculate risk metrics.")
+st.caption("Upload bank statements. Extracts multi-line transactions, isolates true revenue from internal transfers, detects MCA positions, and calculates NSF risk.")
 st.divider()
 
 # --- LENDER DICTIONARY WITH ALIASES & TIERS ---
@@ -38,29 +39,40 @@ KNOWN_FUNDERS = {
     "Flex Capital Group": {"tier": "Standard", "keywords": ["FLEXCAPITALGROUP", "FLEX CAPITAL", "FLEX CAPITAL GROUP"]},
     "ONTAP Capital": {"tier": "Standard", "keywords": ["ONTAP", "ONTAP CAPITAL", "ON TAP CAPITAL"]},
     "Clara Capital": {"tier": "Standard", "keywords": ["CLARA CAPITAL", "CLARA"]},
-    "FUNDFI": {"tier": "Standard", "keywords": ["FUNDFI", "FUND FI", "FUND-FI"]}
+    "FUNDFI": {"tier": "Standard", "keywords": ["FUNDFI", "FUND FI", "FUND-FI"]},
+    "TFG Financial": {"tier": "Standard", "keywords": ["TFG FINANCIAL", "TFG FINANCIAL CORPORATION"]}
 }
 
 # --- PARSING FILTERS & REGEX ---
-NSF_KEYWORDS = ["NSF FEE", "NSF CHARGE", "NON-SUFFICIENT", "OVERDRAFT", "RETURNED ITEM", "OVERDRAWN"]
-
-JUNK_LINES = [
-    "ACCOUNT SUMMARY", "TOTAL AMOUNT", "NO. OF DEBITS", "NO. OF CREDITS", 
-    "ITEM VOLUME", "TOTAL SERVICE CHARGES", "UNCOLLECTED FEES", "PLEASE EXAMINE", 
-    "GST REGISTRATION", "REGISTERED TRADEMARK", "ACCOUNT DETAILS", 
-    "WITHDRAWALS/DEBITS", "DEPOSITS/CREDITS", "BALANCE ($)", "STATEMENT OF"
+NSF_KEYWORDS = [
+    "NSF FEE", "NSF CHARGE", "NON-SUFFICIENT", "OVERDRAFT", "RETURNED ITEM", 
+    "OVERDRAWN HANDLING CHGS", "OVERDRAWN", "OVERDRAFT INTEREST CHG"
 ]
 
+# Headers & Footers to completely ignore
+JUNK_LINES = [
+    "P.O. BOX", "AMHERST NS", "STATEMENT OF:", "BUSINESS ACCOUNT", "ACCOUNT DETAILS:", 
+    "ACCOUNT SUMMARY", "UNCOLLECTED FEES", "PLEASE EXAMINE", "THIS IS YOUR OFFICIAL", 
+    "ALL SERVICE FEES", "GST REGISTRATION", "REGISTERED TRADEMARK", "ITEM VOLUME RATE", 
+    "TRANSACTIONS OVER PLAN", "SUB TOTAL", "TOTAL SERVICE CHARGES", "WITHDRAWALS/DEBITS", 
+    "DEPOSITS/CREDITS", "NO. OF DEBITS", "EQUIFAX", "CREDIT PORTFOLIO INSIGHTS", "FICO SCORE"
+]
+
+# Strict exclusions for True Revenue (Internal transfers, refunds, corrections, loans)
 REVENUE_EXCLUSIONS = [
     "INTERNAL TRANSFER", "TRANSFER FROM", "TRSF FROM", "MEMO TRANSFER", "ACCOUNT TRANSFER", 
-    "LOAN", "BDC HASCAP", "LINE OF CREDIT", "LOC DRAW", "CASH ADVANCE", "ADVANCE PROCEEDS", 
-    "REVERSAL", "REFUND", "RETURNED", "RTN WIRE", "PAYROLL", "UNITED TRADING", "ACCOUNTS PAYABLE"
+    "MB-TRANSFER", "LOAN", "BDC HASCAP", "LINE OF CREDIT", "LOC DRAW", "CASH ADVANCE", 
+    "ADVANCE PROCEEDS", "REVERSAL", "REFUND", "RETURNED", "RTN WIRE", "PAYROLL", 
+    "ERROR CORRECTION", "UNITED TRADING", "ACCOUNTS PAYABLE"
 ]
 for f_data in KNOWN_FUNDERS.values():
     REVENUE_EXCLUSIONS.extend(f_data["keywords"])
 
-# Regex pattern for MM/DD/YYYY, YYYY-MM-DD, DD-MMM-YYYY, MM/DD/YY
+# Flexible date matcher (MM/DD/YYYY, YYYY-MM-DD, DD-MMM-YYYY, MM/DD/YY)
 DATE_REGEX = r"^(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2}|\d{2}-[A-Za-z]{3}-\d{4}|\d{2}/\d{2}/\d{2})"
+
+# Improved Amount Matcher: Handles numbers with OR without thousands-separating commas (e.g., 2176.62 or 2,176.62)
+AMOUNT_REGEX = r"(?:^|\s)\$?(\d[\d,]*\.\d{2}-?)(?=\s|$)"
 
 # --- SECTION 1: BANK STATEMENT PDF UPLOADER ---
 st.subheader("1. Bank Statement Ingestion & Month-by-Month Analysis")
@@ -82,12 +94,18 @@ monthly_data_store = defaultdict(lambda: {
 mca_tracker = defaultdict(lambda: {"total_amount": 0.0, "debit_count": 0})
 
 if uploaded_files:
-    st.info("📁 **Processing Documents...** Grouping transactions and reconciling balances.")
+    st.info("📁 **Processing Documents...** Building transaction blocks and running mathematical balance proofs.")
     
     running_balance = None
 
     for pdf_file in uploaded_files:
         with pdfplumber.open(pdf_file) as pdf:
+            # Document Guardrail: Ensure this is a bank statement, not a credit report or invoice
+            full_pdf_text = " ".join([(p.extract_text() or "") for p in pdf.pages]).upper()
+            if "EQUIFAX" in full_pdf_text or "CREDIT PORTFOLIO INSIGHTS" in full_pdf_text:
+                st.warning(f"⚠️ Skipped non-bank statement document: **{pdf_file.name}** (Credit Report Detected)")
+                continue
+
             transactions = []
             current_tx = []
             
@@ -95,46 +113,55 @@ if uploaded_files:
                 text = page.extract_text()
                 if not text: continue
                 
-                lines = text.split("\n")
+                lines = [l.strip() for l in text.split("\n") if l.strip()]
+                
+                # Page Guardrail: Skip service charge summary detail pages
+                if any("SERVICE CHARGE" in line.upper() for line in lines) and any("SBAP MONTHLY FEE" in line.upper() for line in lines):
+                    continue
+                
                 for line in lines:
-                    line_clean = line.strip()
-                    if not line_clean: continue
+                    upper_line = line.upper()
                     
-                    upper_line = line_clean.upper()
-                    
+                    # 1. Ignore headers, footers, and summary boxes
                     if any(junk in upper_line for junk in JUNK_LINES):
                         continue
-                        
-                    # Match dates across formats
-                    if re.match(DATE_REGEX, line_clean):
+                    if re.search(r"^\d+\s+of\s+\d+", line, re.IGNORECASE): # e.g. "1 of 3"
+                        continue
+                    if re.search(r"^\d+\s+\$?[\d,]+\.\d{2}\s+\d+\s+\$?[\d,]+\.\d{2}", line): # Page summary totals
+                        continue
+
+                    # 2. Block transactions by Date Trigger
+                    if re.match(DATE_REGEX, line):
                         if current_tx:
                             transactions.append(" ".join(current_tx))
-                        current_tx = [line_clean]
+                        current_tx = [line]
                     elif current_tx:
-                        if "SCOTIABANK" in upper_line or "P.O. BOX" in upper_line or "PAGE " in upper_line:
-                            continue
-                        current_tx.append(line_clean)
+                        current_tx.append(line)
             
             if current_tx:
                 transactions.append(" ".join(current_tx))
 
-            # Process isolated transaction blocks
+            # 3. Process Isolated Transaction Blocks
             for tx in transactions:
                 tx_upper = tx.upper()
                 
-                # Extract date string
+                # Clean trailing footer text if attached to bottom transaction
+                for disclaimer in ["TERMS AND CONDITIONS", "PLEASE EXAMINE", "BE PAYABLE BY"]:
+                    if disclaimer in tx_upper:
+                        tx_upper = tx_upper.split(disclaimer)[0].strip()
+                        tx = tx.split(disclaimer)[0].strip()
+
                 date_match = re.match(DATE_REGEX, tx)
                 if not date_match: continue
                 
                 raw_date_str = date_match.group(1)
                 try:
                     parsed_dt = pd.to_datetime(raw_date_str, format='mixed', dayfirst=False)
-                    month_label = parsed_dt.strftime("%b %Y")  # e.g., "Jan 2025"
+                    month_label = parsed_dt.strftime("%b %Y")  # e.g., "May 2026"
                 except Exception:
                     continue
 
-                raw_amounts = re.findall(r"(?:^|\s)\$?(\d{1,3}(?:,\d{3})*\.\d{2}-?)(?=\s|$)", tx_upper)
-                
+                raw_amounts = re.findall(AMOUNT_REGEX, tx_upper)
                 amounts = []
                 for a in raw_amounts:
                     clean_a = a.replace(",", "")
@@ -144,6 +171,7 @@ if uploaded_files:
                 
                 if not amounts: continue
 
+                # Handle Starting/Opening Balances
                 if "BALANCE FORWARD" in tx_upper or "OPENING BALANCE" in tx_upper:
                     running_balance = amounts[-1]
                     if monthly_data_store[month_label]["Start Balance"] == 0.0:
@@ -161,10 +189,9 @@ if uploaded_files:
                 is_credit = False
                 is_debit = False
 
-                # Balance Math Proof
+                # 4. Balance Math Proof Engine
                 if running_balance is not None and balance_amount is not None:
                     diff = round(balance_amount - running_balance, 2)
-                    
                     for amt in amounts[:-1]:
                         if abs(diff - amt) < 0.05:
                             is_credit = True
@@ -175,17 +202,15 @@ if uploaded_files:
                             primary_amount = amt
                             break
 
-                # Fallback Keyword Matching
+                # Text Fallback Logic
                 if not is_credit and not is_debit:
                     primary_amount = amounts[-2] if len(amounts) >= 2 else amounts[0]
-                    if any(kw in tx_upper for kw in ["CREDIT", "DEPOSIT", "INCOMING", "E-TRANSFER", "PAYABLE", "RTN WIRE"]):
+                    if any(kw in tx_upper for kw in ["CREDIT", "DEPOSIT", "INCOMING", "E-TRANSFER", "PAYABLE", "RTN WIRE", "ERROR CORRECTION", "REFUND"]):
                         is_credit = True
-                        if primary_amount < 0: primary_amount = abs(primary_amount)
                     elif any(kw in tx_upper for kw in ["DEBIT", "PAYMENT", "PAD", "WITHDRAWAL", "FEE", "OUTGOING", "CHQ", "CHEQUE", "CHARGE", "LEASE", "PURCHASE"]):
                         is_debit = True
-                        if primary_amount < 0: primary_amount = abs(primary_amount)
 
-                # Categorization
+                # Categorize Amounts
                 if is_credit:
                     monthly_data_store[month_label]["Stated Credits"] += primary_amount
                     if not any(excl in tx_upper for excl in REVENUE_EXCLUSIONS):
@@ -193,6 +218,7 @@ if uploaded_files:
                         
                 elif is_debit:
                     monthly_data_store[month_label]["Stated Debits"] += primary_amount
+                    
                     if any(kw in tx_upper for kw in NSF_KEYWORDS):
                         monthly_data_store[month_label]["NSF Count"] += 1
                         total_nsf_count += 1
@@ -207,7 +233,7 @@ if uploaded_files:
                     running_balance = balance_amount
                     monthly_data_store[month_label]["End Balance"] = balance_amount
 
-    # Build Final Tables & Averages
+    # Build Final Summary Output Tables
     num_active_months = max(1, len(monthly_data_store))
     chart_data = []
     total_true_revenue = 0.0
@@ -263,7 +289,7 @@ if uploaded_files:
         use_container_width=True, hide_index=True
     )
 
-    # Visual Bar Chart: Deposits vs True Revenue
+    # Deposits vs True Revenue Bar Chart
     st.markdown("### 📈 Stated Deposits vs. True Revenue Comparison")
     if not df_breakdown.empty:
         chart_df = df_breakdown.set_index("Month")[["Stated Credits ($)", "True Revenue ($)"]]
@@ -271,7 +297,7 @@ if uploaded_files:
 
     st.markdown("### 📌 Multi-Month Overview & Averages")
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Active Months", f"{num_active_months} Months")
+    c1.metric("Active Months", f"{num_active_months} Month(s)")
     c2.metric("Avg Monthly Deposits", f"${avg_monthly_credits:,.2f}", f"${total_stated_credits:,.2f} Total")
     c3.metric("Avg True Monthly Rev", f"${auto_monthly_revenue:,.2f}", f"${total_true_revenue:,.2f} Total")
     c4.metric("Avg Monthly Debits", f"${avg_monthly_debits:,.2f}", f"${total_stated_debits:,.2f} Total")
@@ -307,7 +333,6 @@ with col_left:
     total_existing_monthly_debt = 0.0
     num_positions = len(st.session_state.positions)
 
-    # Safe delete handling via state indices
     to_delete = None
     for i, pos in enumerate(st.session_state.positions):
         st.markdown(f"**Position #{i+1}**")
