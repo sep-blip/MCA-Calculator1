@@ -1,8 +1,9 @@
 import streamlit as st
 import pandas as pd
 import re
+import pdfplumber
+import io
 from collections import defaultdict
-from pypdf import PdfReader  # Lightweight, high-speed PDF reader
 
 st.set_page_config(page_title="MCA Bank Parser & Underwriting Tool", page_icon="💳", layout="wide")
 
@@ -49,7 +50,7 @@ REVENUE_EXCLUSIONS = [
     "RTN WIRE", "PAYROLL", "ERROR CORRECTION", "EXPIRED INTERAC", "UNITED TRADING", "ACCOUNTS PAYABLE"
 ]
 
-# --- CACHED PDF PARSING ENGINE (PREVENTS RE-PARSING CRASHES) ---
+# --- CACHED PDF PARSING ENGINE ---
 @st.cache_data(show_spinner="📄 Processing and analyzing uploaded statements...")
 def parse_uploaded_pdfs(files_data):
     monthly_store = defaultdict(lambda: {
@@ -61,14 +62,17 @@ def parse_uploaded_pdfs(files_data):
 
     for file_name, file_bytes in files_data:
         try:
-            reader = PdfReader(file_bytes)
-            full_pdf_text = ""
-            for page in reader.pages:
-                full_pdf_text += (page.extract_text() or "") + "\n"
+            # Wrap bytes in io.BytesIO stream to fix 'bytes' object has no attribute 'seek'
+            pdf_stream = io.BytesIO(file_bytes)
+            
+            with pdfplumber.open(pdf_stream) as pdf:
+                full_pdf_text = ""
+                for page in pdf.pages:
+                    full_pdf_text += (page.extract_text() or "") + "\n"
 
             full_pdf_upper = full_pdf_text.upper()
 
-            # Guardrail: Skip Non-Bank Documents
+            # Guardrail: Skip Non-Bank Documents (e.g. Credit Reports)
             if "EQUIFAX" in full_pdf_upper or "CREDIT PORTFOLIO INSIGHTS" in full_pdf_upper:
                 warnings.append(f"Skipped non-bank statement: **{file_name}** (Credit Report Detected)")
                 continue
@@ -76,7 +80,7 @@ def parse_uploaded_pdfs(files_data):
             is_rbc = "ROYAL BANK OF CANADA" in full_pdf_upper or "RBC" in full_pdf_upper
             is_scotia = "SCOTIABANK" in full_pdf_upper or "BANK OF NOVA SCOTIA" in full_pdf_upper
 
-            # Extract Month Label safely
+            # Extract Month Label
             month_label = "Unknown Month"
             try:
                 if is_rbc:
@@ -188,7 +192,7 @@ total_nsf_count = 0
 detected_funder_positions = []
 
 if uploaded_files:
-    # Convert uploaded files to Bytes to pass into cached function
+    # Convert Streamlit UploadedFile objects to bytes payload
     files_payload = [(f.name, f.getvalue()) for f in uploaded_files]
     monthly_data_store, mca_tracker, warnings = parse_uploaded_pdfs(files_payload)
 
