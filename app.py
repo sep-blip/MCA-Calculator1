@@ -5,10 +5,10 @@ import pdfplumber
 import io
 from collections import defaultdict
 
-st.set_page_config(page_title="MCA Bank Parser & Underwriting Tool", page_icon="💳", layout="wide")
+st.set_page_config(page_title="Forward Funding MCA Pricing Tool", page_icon="💳", layout="wide")
 
 st.title("💳 MCA Universal Bank Parser & Underwriting Engine")
-st.caption("Upload bank statements (RBC, Scotiabank, CIBC, TD, BMO, Chase, BofA). Extracts multi-line transactions, isolates true revenue from internal transfers, detects competitor MCA debits, and calculates true MCA DSR.")
+st.caption("Upload bank statements (Canadian Business Bank Account Only). Qualitative factors to be adjusted by user as well as factor rates and max DSR rate.")
 st.divider()
 
 # --- LENDER DICTIONARY WITH ALIASES & TIERS ---
@@ -20,7 +20,7 @@ KNOWN_FUNDERS = {
     "Driven": {"tier": "Premium", "keywords": ["DRIVEN", "DRIVEN CAPITAL", "DRIVEN FINANCIAL"]},
     "Journey / OnDeck": {"tier": "Premium", "keywords": ["JOURNEY CAPITAL", "JOURNEY/ONDECK", "JOURNEY FUNDING", "ONDECK"]},
     "iCapital": {"tier": "Premium", "keywords": ["ICAPITAL", "I CAPITAL", "I-CAPITAL"]},
-    "Canacap": {"tier": "Standard", "keywords": ["CANA CAP", "CANACAP", "CANA CAPITAL", "CANACAPITAL"]},
+    "Canacap": {"tier": "Standard", "keywords": ["CANA CAP", "CANACAP", "CANA CAPITAL", "CANACAPITAL", "CCP","ccp"]},
     "2M7": {"tier": "Standard", "keywords": ["2M7", "URAL", "URAL CAPITAL", "2M7 FINANCIAL"]},
     "Bizfund": {"tier": "Standard", "keywords": ["BIZFUND", "BIZ FUND", "BIZ-FUND"]},
     "Xuper": {"tier": "Standard", "keywords": ["XUPER", "XUPER FUNDING", "XUPER CAPITAL"]},
@@ -53,7 +53,7 @@ REVENUE_EXCLUSIONS = [
 ]
 
 # --- CACHED UNIVERSAL PDF PARSING ENGINE ---
-@st.cache_data(show_spinner="📄 Extracting financial data from bank statements...")
+@st.cache_data(show_spinner="📄 Extracting financial data ...")
 def parse_uploaded_pdfs(files_data):
     monthly_store = defaultdict(lambda: {
         "Start Balance": 0.0, "Stated Credits": 0.0, "Non-Revenue": 0.0, 
@@ -341,7 +341,7 @@ if uploaded_files:
         c1.metric("Active Months", f"{num_active_months} Month(s)")
         c2.metric("Avg Monthly Deposits", f"${avg_monthly_credits:,.2f}", f"${total_stated_credits:,.2f} Total")
         c3.metric("Avg True Monthly Rev", f"${auto_monthly_revenue:,.2f}", f"${total_true_revenue:,.2f} Total")
-        c4.metric("Avg Competitor MCA Debt", f"${avg_mca_debits:,.2f} / mo", f"${total_mca_debits:,.2f} Total")
+        c4.metric("Avg MCA Debt", f"${avg_mca_debits:,.2f} / mo", f"${total_mca_debits:,.2f} Total")
         c5.metric("NSF Fees (≥$20)", f"{total_nsf_count} Total", f"{avg_nsf_per_month:.1f} / mo", delta_color="inverse" if total_nsf_count > 0 else "normal")
 
 st.divider()
@@ -360,7 +360,7 @@ with col_left:
     )
 
     st.markdown("#### Detected Debt Positions")
-    st.caption("Funder, frequency, and payment amount dynamically calculated from statement history.")
+    st.caption("Funder, frequency, and payment calculated from statement history.")
 
     if "positions" not in st.session_state or uploaded_files:
         if detected_funder_positions:
