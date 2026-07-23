@@ -7,7 +7,7 @@ from collections import defaultdict
 st.set_page_config(page_title="MCA Bank Parser & Underwriting Tool", page_icon="💳", layout="wide")
 
 st.title("💳 MCA Statement Analyzer & Underwriting Engine")
-st.caption("Upload bank statements (individual or merged). The engine isolates true revenue via transaction blocking, ignores running balances, and calculates MCA positions.")
+st.caption("Upload bank statements (individual or merged). The engine isolates true revenue, proves deposits via balance math, and calculates MCA positions.")
 st.divider()
 
 # --- LENDER DICTIONARY WITH ALIASES & TIERS ---
@@ -15,7 +15,7 @@ KNOWN_FUNDERS = {
     "Merchant Growth": {"tier": "Premium", "keywords": ["MERCHPAD", "MERCH PAD", "MERCHANT GROWTH"]},
     "Greenbox": {"tier": "Premium", "keywords": ["GREENBOX", "GREEN BOX", "GREENBOX CAPITAL"]},
     "Vault": {"tier": "Premium", "keywords": ["VAULT", "VAULT FINANCIAL"]},
-    "Driven": {"tier": "Premium", "keywords": ["DRIVEN", "DRIVEN CAPITAL"]},
+    "Driven": {"tier": "Premium", "keywords": ["DRIVEN", "DRIVEN CAPITAL", "DRIVEN FINANCIAL"]},
     "Journey": {"tier": "Premium", "keywords": ["JOURNEY CAPITAL", "JOURNEY", "JOURNEY FUNDING", "ONDECK"]},
     "iCapital": {"tier": "Premium", "keywords": ["ICAPITAL", "I CAPITAL", "I-CAPITAL"]},
     "Canacap": {"tier": "Standard", "keywords": ["CANA CAP", "CANACAP", "CANA CAPITAL", "CANACAPITAL"]},
@@ -46,12 +46,13 @@ MONTH_MAP = {"01": "Jan", "02": "Feb", "03": "Mar", "04": "Apr", "05": "May", "0
              "07": "Jul", "08": "Aug", "09": "Sep", "10": "Oct", "11": "Nov", "12": "Dec"}
 
 NSF_KEYWORDS = ["NSF FEE", "NSF CHARGE", "NON-SUFFICIENT FEE", "OVERDRAFT FEE", "RETURNED ITEM FEE"]
+JUNK_HEADERS = ["SCOTIABANK", "APPLEWOOD VILLAGE", "MISSISSAUGA", "STATEMENT OF", "ACCOUNT NUMBER", "NO. OF DEBITS", "TOTAL AMOUNT", "PAGE ", "UNCOLLECTED FEES", "PLEASE EXAMINE", "GST REGISTRATION", "REGISTERED TRADEMARK", "TRANSACTION FEES", "SUB TOTAL", "SERVICE CHARGE SUMMARY"]
 
 # Strict exclusions for True Revenue
 REVENUE_EXCLUSIONS = [
     "INTERNAL TRANSFER", "TRANSFER FROM", "TRSF FROM", "MEMO TRANSFER", "ACCOUNT TRANSFER", 
     "LOAN", "BDC HASCAP", "LINE OF CREDIT", "LOC DRAW", "CASH ADVANCE", "ADVANCE PROCEEDS", 
-    "REVERSAL", "REFUND", "RETURNED", "RTN WIRE", "PAYROLL", "UNITED TRADING"
+    "REVERSAL", "REFUND", "RETURNED", "RTN WIRE", "PAYROLL", "UNITED TRADING", "ACCOUNTS PAYABLE"
 ]
 for f_data in KNOWN_FUNDERS.values():
     REVENUE_EXCLUSIONS.extend(f_data["keywords"])
@@ -68,68 +69,112 @@ uploaded_files = st.file_uploader(
 auto_monthly_revenue = 0.0
 total_nsf_count = 0
 detected_funder_positions = []
-monthly_data_store = defaultdict(lambda: {"True Revenue": 0.0, "NSF Count": 0})
+
+# Data store specifically for the Output Chart
+monthly_data_store = defaultdict(lambda: {
+    "Start Balance": 0.0, "Stated Credits": 0.0, "True Revenue": 0.0, 
+    "Stated Debits": 0.0, "End Balance": 0.0, "NSF Count": 0
+})
 mca_tracker = defaultdict(lambda: {"total_amount": 0.0, "debit_count": 0})
 
 if uploaded_files:
-    st.info("📁 **Processing Documents...** Extracting summaries and calculating line-by-line true revenue.")
+    st.info("📁 **Processing Documents...** Running mathematical balance proofs and isolating true revenue.")
     
+    running_balance = None
+
     for pdf_file in uploaded_files:
         with pdfplumber.open(pdf_file) as pdf:
             transactions = []
-            current_tx = ""
+            current_tx = []
             
-            # 1. Block transactions by Date to prevent bleed-over
+            # 1. Isolate strict transaction blocks, completely ignoring bank headers/footers
             for page in pdf.pages:
                 text = page.extract_text()
                 if not text: continue
                 
-                lines = text.split("\n")
-                for line in lines:
+                for line in text.split("\n"):
                     line_clean = line.strip()
                     if not line_clean: continue
                     
-                    # Match Scotiabank Date Format: MM/DD/YYYY
+                    upper_line = line_clean.upper()
+                    if any(junk in upper_line for junk in JUNK_HEADERS):
+                        continue
+                    
+                    # If line starts with MM/DD/YYYY, start a new transaction block
                     if re.match(r"^\d{2}/\d{2}/\d{4}", line_clean):
                         if current_tx:
-                            transactions.append(current_tx)
-                        current_tx = line_clean
+                            transactions.append(" ".join(current_tx))
+                        current_tx = [line_clean]
                     elif current_tx:
-                        current_tx += " " + line_clean
+                        current_tx.append(line_clean)
             
             if current_tx:
-                transactions.append(current_tx)
+                transactions.append(" ".join(current_tx))
 
-            # 2. Process each transaction block independently
+            # 2. Process extracted transactions
             for tx in transactions:
                 tx_upper = tx.upper()
                 
-                # Identify Month
                 month_str = tx[:2]
                 month_label = MONTH_MAP.get(month_str, "Unknown")
                 if month_label == "Unknown": continue
 
-                # Extract Dollar Amounts (Grabs amounts with or without decimals)
-                raw_amounts = re.findall(r"(?<!\S)(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)(?!\S)", tx_upper)
-                amounts = [float(a.replace(",", "")) for a in raw_amounts]
+                # Regex captures dollar amounts with or without decimals, ignoring long reference numbers
+                raw_amounts = re.findall(r"(?<!\S)\$?\d{1,3}(?:[.,]\d{3})*(?:\.\d{2})?(?!\S)", tx_upper)
                 
-                if len(amounts) >= 2:
-                    # In Scotiabank layout, the transaction is second to last, balance is last.
-                    primary_amount = amounts[-2]
-                elif len(amounts) == 1:
-                    primary_amount = amounts[0]
-                else:
+                amounts = []
+                for a in raw_amounts:
+                    clean_a = a.replace("$", "").replace(",", "")
+                    if clean_a.count(".") > 1: # Fixes OCR dot errors
+                        parts = clean_a.rsplit(".", 1)
+                        clean_a = parts[0].replace(".", "") + "." + parts[1]
+                    amounts.append(float(clean_a))
+                
+                if not amounts:
                     continue
 
-                # Classify transaction type
-                is_credit = any(kw in tx_upper for kw in ["CREDIT", "DEPOSIT", "INCOMING"])
-                is_debit = any(kw in tx_upper for kw in ["DEBIT", "PAYMENT", "PAD", "WITHDRAWAL", "FEE", "OUTGOING", "CHQ", "CHEQUE", "SERVICE CHARGE"])
-                
-                # E-Transfers fallback
-                if "INTERAC E-TRANSFER" in tx_upper and not is_debit:
-                    is_credit = True
+                # Set Start Balance when explicitly stated
+                if "BALANCE FORWARD" in tx_upper:
+                    running_balance = amounts[-1]
+                    monthly_data_store[month_label]["Start Balance"] = running_balance
+                    continue
 
-                if is_debit:
+                primary_amount = 0.0
+                balance_amount = None
+
+                if len(amounts) >= 2:
+                    primary_amount = amounts[-2]
+                    balance_amount = amounts[-1]
+                elif len(amounts) == 1:
+                    primary_amount = amounts[0]
+
+                # 3. Hybrid Classification (Math Proofing + Text Fallback)
+                is_credit = False
+                is_debit = False
+
+                if running_balance is not None and balance_amount is not None:
+                    diff = balance_amount - running_balance
+                    # Prove mathematically if it was a deposit or withdrawal
+                    if abs(diff - primary_amount) < 0.10:
+                        is_credit = True
+                    elif abs(diff - (-primary_amount)) < 0.10:
+                        is_debit = True
+
+                # Fallback to text if math proof is unavailable (missing previous balance)
+                if not is_credit and not is_debit:
+                    if any(kw in tx_upper for kw in ["CREDIT", "DEPOSIT", "INCOMING", "E-TRANSFER", "PAYABLE", "RTN WIRE"]):
+                        is_credit = True
+                    elif any(kw in tx_upper for kw in ["DEBIT", "PAYMENT", "PAD", "WITHDRAWAL", "FEE", "OUTGOING", "CHQ", "CHEQUE", "SERVICE CHARGE", "LEASE"]):
+                        is_debit = True
+
+                # 4. Data Allocation
+                if is_credit:
+                    monthly_data_store[month_label]["Stated Credits"] += primary_amount
+                    if not any(excl in tx_upper for excl in REVENUE_EXCLUSIONS):
+                        monthly_data_store[month_label]["True Revenue"] += primary_amount
+                        
+                elif is_debit:
+                    monthly_data_store[month_label]["Stated Debits"] += primary_amount
                     if any(kw in tx_upper for kw in NSF_KEYWORDS):
                         monthly_data_store[month_label]["NSF Count"] += 1
                         total_nsf_count += 1
@@ -141,11 +186,13 @@ if uploaded_files:
                             mca_tracker[lender_name]["total_amount"] += primary_amount
                             mca_tracker[lender_name]["debit_count"] += 1
                             break 
-                            
-                elif is_credit:
-                    if not any(excl in tx_upper for excl in REVENUE_EXCLUSIONS):
-                        monthly_data_store[month_label]["True Revenue"] += primary_amount
+                
+                # Update running balance for next math check
+                if balance_amount is not None:
+                    running_balance = balance_amount
+                    monthly_data_store[month_label]["End Balance"] = balance_amount
 
+    # Prepare Chart Output Data
     num_active_months = max(1, len(monthly_data_store))
     chart_data = []
     total_true_revenue = 0.0
@@ -153,8 +200,12 @@ if uploaded_files:
     for month, data in monthly_data_store.items():
         chart_data.append({
             "Month": month,
+            "Start Balance ($)": data["Start Balance"],
+            "Stated Credits ($)": data["Stated Credits"],
             "True Revenue ($)": data["True Revenue"],
-            "NSF Fees": data["NSF Count"]
+            "Stated Debits ($)": data["Stated Debits"],
+            "NSF Fees": data["NSF Count"],
+            "End Balance ($)": data["End Balance"]
         })
         total_true_revenue += data["True Revenue"]
 
@@ -162,7 +213,7 @@ if uploaded_files:
     auto_monthly_revenue = total_true_revenue / num_active_months
     avg_nsf_per_month = total_nsf_count / num_active_months
 
-    # Process MCA Positions (Frequency via Math)
+    # Process MCA Positions
     for lender, data in mca_tracker.items():
         avg_debits_per_month = data["debit_count"] / num_active_months
         freq = "Daily" if avg_debits_per_month > 8 else "Weekly"
@@ -181,7 +232,12 @@ if uploaded_files:
     st.markdown("### 📊 Extracted Financial Chart")
     st.dataframe(
         df_breakdown.style.format({
-            "True Revenue ($)": "${:,.2f}"
+            "Start Balance ($)": "${:,.2f}",
+            "Stated Credits ($)": "${:,.2f}",
+            "True Revenue ($)": "${:,.2f}",
+            "Stated Debits ($)": "${:,.2f}",
+            "End Balance ($)": "${:,.2f}",
+            "NSF Fees": "{:,.0f}"
         }), 
         use_container_width=True, hide_index=True
     )
