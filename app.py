@@ -7,7 +7,7 @@ from collections import defaultdict
 st.set_page_config(page_title="MCA Bank Parser & Underwriting Tool", page_icon="💳", layout="wide")
 
 st.title("💳 MCA Statement Analyzer & Underwriting Engine")
-st.caption("Upload bank statements (individual or merged). The engine isolates true revenue, extracts summary balances, and calculates MCA positions line-by-line.")
+st.caption("Upload bank statements (individual or merged). The engine isolates true revenue, ignores running balances, and calculates MCA positions.")
 st.divider()
 
 # --- LENDER DICTIONARY WITH ALIASES & TIERS ---
@@ -42,25 +42,23 @@ KNOWN_FUNDERS = {
 }
 
 # --- PARSING FILTERS & REGEX ---
-# Month mappings to detect current statement month from dates
 MONTH_MAP = {"01": "Jan", "02": "Feb", "03": "Mar", "04": "Apr", "05": "May", "06": "Jun", 
              "07": "Jul", "08": "Aug", "09": "Sep", "10": "Oct", "11": "Nov", "12": "Dec",
              "JAN": "Jan", "FEB": "Feb", "MAR": "Mar", "APR": "Apr", "MAY": "May", "JUN": "Jun",
              "JUL": "Jul", "AUG": "Aug", "SEP": "Sep", "OCT": "Oct", "NOV": "Nov", "DEC": "Dec"}
 
-VALID_REVENUE_KEYWORDS = ["DEPOSIT", "CREDIT", "ACH IN", "SQUARE", "STRIPE", "CLOVER", "E-TRANSFER", "ETRANSFER", "INTERAC", "WIRE IN"]
+NSF_KEYWORDS = ["NSF FEE", "NSF CHARGE", "NON-SUFFICIENT FEE", "OVERDRAFT FEE", "RETURNED ITEM FEE"]
 
-# Strict exclusions for True Revenue (Transfers, Loans, Existing MCA Funders)
+# Strict exclusions for True Revenue (Internal Transfers, Loans, Refunds, Account Owner Names)
 REVENUE_EXCLUSIONS = [
     "INTERNAL TRANSFER", "TRANSFER FROM", "TRSF FROM", "MEMO TRANSFER", "ACCOUNT TRANSFER", 
-    "LOAN PROCEEDS", "LINE OF CREDIT", "LOC DRAW", "CASH ADVANCE", "ADVANCE PROCEEDS", 
-    "REVERSAL", "REFUND", "RETURNED", "PAYROLL"
+    "LOAN", "BDC HASCAP", "LINE OF CREDIT", "LOC DRAW", "CASH ADVANCE", "ADVANCE PROCEEDS", 
+    "REVERSAL", "REFUND", "RETURNED", "RTN WIRE", "PAYROLL", "UNITED TRADING"
 ]
-# Add MCA keywords to exclusions so funding deposits aren't counted as true revenue
+# Add all MCA keywords to exclusions so funding deposits aren't counted as organic revenue
 for f_data in KNOWN_FUNDERS.values():
     REVENUE_EXCLUSIONS.extend(f_data["keywords"])
 
-NSF_KEYWORDS = ["NSF FEE", "NSF CHARGE", "NON-SUFFICIENT FEE", "OVERDRAFT FEE", "RETURNED ITEM FEE"]
 
 # --- SECTION 1: BANK STATEMENT PDF UPLOADER ---
 st.subheader("1. Bank Statement Ingestion & Month-by-Month Analysis")
@@ -74,11 +72,7 @@ uploaded_files = st.file_uploader(
 auto_monthly_revenue = 0.0
 total_nsf_count = 0
 detected_funder_positions = []
-monthly_data_store = defaultdict(lambda: {
-    "Start Balance": 0.0, "End Balance": 0.0, 
-    "Stated Credits": 0.0, "Stated Debits": 0.0, 
-    "True Revenue": 0.0, "NSF Count": 0
-})
+monthly_data_store = defaultdict(lambda: {"True Revenue": 0.0, "NSF Count": 0})
 mca_tracker = defaultdict(lambda: {"total_amount": 0.0, "debit_count": 0})
 
 if uploaded_files:
@@ -94,8 +88,18 @@ if uploaded_files:
                     continue
                 
                 lines = text.split("\n")
+                recent_lines = [] # Rolling buffer to catch multi-line transaction descriptions
+                
                 for line in lines:
-                    line_upper = line.upper()
+                    line_upper = line.upper().strip()
+                    if not line_upper: continue
+                    
+                    # Keep a rolling window of the last 3 lines for context
+                    recent_lines.append(line_upper)
+                    if len(recent_lines) > 3:
+                        recent_lines.pop(0)
+                        
+                    context_text = " ".join(recent_lines)
                     
                     # 1. Detect active month from transaction dates (e.g. 04/15 or Apr 15)
                     date_match = re.search(r"^\s*(?:(\d{2})/\d{2}|(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC))\b", line_upper)
@@ -104,57 +108,55 @@ if uploaded_files:
                         if matched_val in MONTH_MAP:
                             current_month_label = MONTH_MAP[matched_val]
 
-                    # Extract all dollar amounts on the line
-                    amounts = re.findall(r"(?<!\$)\b\d{1,3}(?:,\d{3})*\.\d{2}\b", line)
-                    if not amounts:
+                    # 2. Extract Dollar Amounts (Handles commas, and captures numbers with OR without decimals)
+                    raw_amounts = re.findall(r"(?<!\S)(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)(?!\S)", line_upper)
+                    if not raw_amounts:
                         continue
                     
-                    # Prevent grabbing the running balance by taking the FIRST amount in the line
-                    primary_amount = float(amounts[0].replace(",", ""))
+                    # Convert found amounts to floats
+                    amounts = [float(a.replace(",", "")) for a in raw_amounts]
+                    
+                    # The first amount on the line is the transaction. The last is usually the balance.
+                    primary_amount = amounts[0]
 
-                    # 2. Extract Bank Summary Headers (Ignore these for line-by-line math)
-                    if re.search(r"(BEGINNING|OPENING|STARTING)\s+BALANCE", line_upper):
-                        monthly_data_store[current_month_label]["Start Balance"] = primary_amount
-                        continue
-                    if re.search(r"(ENDING|CLOSING)\s+BALANCE", line_upper):
-                        monthly_data_store[current_month_label]["End Balance"] = primary_amount
-                        continue
-                    if re.search(r"TOTAL\s+(CREDITS|DEPOSITS|ADDITIONS)", line_upper):
-                        monthly_data_store[current_month_label]["Stated Credits"] = primary_amount
-                        continue
-                    if re.search(r"TOTAL\s+(DEBITS|WITHDRAWALS|SUBTRACTIONS)", line_upper):
-                        monthly_data_store[current_month_label]["Stated Debits"] = primary_amount
+                    # 3. Explicitly ignore Bank Summary headers and balances
+                    if any(excl in context_text for excl in ["BEGINNING BALANCE", "ENDING BALANCE", "OPENING BALANCE", "CLOSING BALANCE", "TOTAL DEPOSITS", "TOTAL CREDITS", "TOTAL DEBITS", "TOTAL WITHDRAWALS"]):
+                        recent_lines = [] # Clear context buffer
                         continue
 
-                    # 3. Process Transaction Lines
-                    # NSF Tracking
-                    if any(kw in line_upper for kw in NSF_KEYWORDS):
-                        monthly_data_store[current_month_label]["NSF Count"] += 1
-                        total_nsf_count += 1
-                        continue
+                    # 4. Classify as Debit or Credit based on Bank Verbiage
+                    is_debit = any(kw in context_text for kw in ["PAD", "PAYMENT", "DEBIT", "WITHDRAWAL", "FEE", "OUTGOING", "SERVICE CHARGE", "CHQ", "CHEQUE"])
+                    is_credit = any(kw in context_text for kw in ["CREDIT", "DEPOSIT", "INCOMING", "E-TRANSFER", "PAYABLE", "RTN WIRE"])
+                    
+                    # Fallback classification for E-Transfers (can be both, but usually credits if not specified as debit)
+                    if "INTERAC E-TRANSFER" in context_text and not is_debit:
+                        is_credit = True
 
-                    # MCA Debit Tracking
-                    is_mca_debit = False
-                    for lender_name, meta in KNOWN_FUNDERS.items():
-                        if any(kw in line_upper for kw in meta["keywords"]):
-                            # Ensure Vault monthly debits are skipped as requested previously
-                            if "restrict_freq" in meta and "MONTHLY" in line_upper:
-                                continue
+                    # 5. Process Transaction
+                    if is_debit:
+                        # NSF Tracking
+                        if any(kw in context_text for kw in NSF_KEYWORDS):
+                            monthly_data_store[current_month_label]["NSF Count"] += 1
+                            total_nsf_count += 1
                             
-                            mca_tracker[lender_name]["total_amount"] += primary_amount
-                            mca_tracker[lender_name]["debit_count"] += 1
-                            is_mca_debit = True
-                            break # Move to next line once matched
-                    
-                    if is_mca_debit:
-                        continue # Do not process MCA debits as revenue or standard withdrawals
-
-                    # True Revenue Calculation
-                    if any(term in line_upper for term in VALID_REVENUE_KEYWORDS):
-                        if not any(excl in line_upper for excl in REVENUE_EXCLUSIONS):
+                        # MCA Debit Tracking
+                        for lender_name, meta in KNOWN_FUNDERS.items():
+                            if any(kw in context_text for kw in meta["keywords"]):
+                                if "restrict_freq" in meta and "MONTHLY" in context_text:
+                                    continue
+                                mca_tracker[lender_name]["total_amount"] += primary_amount
+                                mca_tracker[lender_name]["debit_count"] += 1
+                                break # Stop searching once lender is found
+                                
+                    elif is_credit:
+                        # True Revenue Calculation (Ensure it doesn't contain exclusions like loans/MCA)
+                        if not any(excl in context_text for excl in REVENUE_EXCLUSIONS):
                             monthly_data_store[current_month_label]["True Revenue"] += primary_amount
+                            
+                    # Clear context buffer after successfully processing a transaction line
+                    recent_lines = []
 
-    # Clean up any data processed before a month was detected
+    # Clean up any stray data processed before the first month was detected
     if "Unknown" in monthly_data_store and len(monthly_data_store) > 1:
         del monthly_data_store["Unknown"]
 
@@ -167,12 +169,8 @@ if uploaded_files:
     for month, data in monthly_data_store.items():
         chart_data.append({
             "Month": month,
-            "Start Balance ($)": data["Start Balance"],
-            "Stated Credits ($)": data["Stated Credits"],
             "True Revenue ($)": data["True Revenue"],
-            "Stated Debits ($)": data["Stated Debits"],
-            "NSF Fees": data["NSF Count"],
-            "End Balance ($)": data["End Balance"]
+            "NSF Fees": data["NSF Count"]
         })
         total_true_revenue += data["True Revenue"]
 
@@ -202,11 +200,7 @@ if uploaded_files:
     st.markdown("### 📊 Extracted Financial Chart")
     st.dataframe(
         df_breakdown.style.format({
-            "Start Balance ($)": "${:,.2f}",
-            "Stated Credits ($)": "${:,.2f}",
-            "True Revenue ($)": "${:,.2f}",
-            "Stated Debits ($)": "${:,.2f}",
-            "End Balance ($)": "${:,.2f}"
+            "True Revenue ($)": "${:,.2f}"
         }), 
         use_container_width=True, hide_index=True
     )
