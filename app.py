@@ -8,7 +8,7 @@ from collections import defaultdict
 st.set_page_config(page_title="MCA Bank Parser & Underwriting Tool", page_icon="💳", layout="wide")
 
 st.title("💳 MCA Universal Bank Parser & Underwriting Engine")
-st.caption("Upload bank statements (RBC, Scotiabank, TD, BMO, Chase). Extracts multi-line transactions, isolates true revenue from internal transfers, detects MCA positions, and calculates NSF risk.")
+st.caption("Upload bank statements (RBC, Scotiabank, TD, BMO, CIBC, Chase, BofA, Wells Fargo). Extracts multi-line transactions, isolates true revenue from internal transfers, detects MCA positions, and calculates NSF risk.")
 st.divider()
 
 # --- LENDER DICTIONARY WITH ALIASES & TIERS ---
@@ -50,19 +50,18 @@ REVENUE_EXCLUSIONS = [
     "RTN WIRE", "PAYROLL", "ERROR CORRECTION", "EXPIRED INTERAC", "UNITED TRADING", "ACCOUNTS PAYABLE"
 ]
 
-# --- CACHED PDF PARSING ENGINE ---
-@st.cache_data(show_spinner="📄 Processing and analyzing uploaded statements...")
+# --- CACHED UNIVERSAL PDF PARSING ENGINE ---
+@st.cache_data(show_spinner="📄 Extracting financial data from bank statements...")
 def parse_uploaded_pdfs(files_data):
     monthly_store = defaultdict(lambda: {
-        "Start Balance": 0.0, "Stated Credits": 0.0, "True Revenue": 0.0, 
-        "Stated Debits": 0.0, "End Balance": 0.0, "NSF Count": 0
+        "Start Balance": 0.0, "Stated Credits": 0.0, "Non-Revenue": 0.0, 
+        "True Revenue": 0.0, "Stated Debits": 0.0, "End Balance": 0.0, "NSF Count": 0
     })
     mca_store = defaultdict(lambda: {"total_amount": 0.0, "debit_count": 0})
     warnings = []
 
     for file_name, file_bytes in files_data:
         try:
-            # Wrap bytes in io.BytesIO stream to fix 'bytes' object has no attribute 'seek'
             pdf_stream = io.BytesIO(file_bytes)
             
             with pdfplumber.open(pdf_stream) as pdf:
@@ -70,9 +69,14 @@ def parse_uploaded_pdfs(files_data):
                 for page in pdf.pages:
                     full_pdf_text += (page.extract_text() or "") + "\n"
 
+            # Check if text exists (Detect Scanned Image PDFs)
+            if len(full_pdf_text.strip()) < 50:
+                warnings.append(f"**{file_name}** appears to be an image/scanned PDF without text layers. Please upload native text PDFs.")
+                continue
+
             full_pdf_upper = full_pdf_text.upper()
 
-            # Guardrail: Skip Non-Bank Documents (e.g. Credit Reports)
+            # Guardrail: Skip Non-Bank Documents
             if "EQUIFAX" in full_pdf_upper or "CREDIT PORTFOLIO INSIGHTS" in full_pdf_upper:
                 warnings.append(f"Skipped non-bank statement: **{file_name}** (Credit Report Detected)")
                 continue
@@ -80,7 +84,7 @@ def parse_uploaded_pdfs(files_data):
             is_rbc = "ROYAL BANK OF CANADA" in full_pdf_upper or "RBC" in full_pdf_upper
             is_scotia = "SCOTIABANK" in full_pdf_upper or "BANK OF NOVA SCOTIA" in full_pdf_upper
 
-            # Extract Month Label
+            # Month Extraction
             month_label = "Unknown Month"
             try:
                 if is_rbc:
@@ -91,17 +95,29 @@ def parse_uploaded_pdfs(files_data):
                     period_match = re.search(r"(\b[A-Za-z]{3}\s+\d{1,2}\s+\d{4}\b)\s+(\b[A-Za-z]{3}\s+\d{1,2}\s+\d{4}\b)", full_pdf_text)
                     if period_match:
                         month_label = pd.to_datetime(period_match.group(2)).strftime("%b %Y")
+                
+                if month_label == "Unknown Month":
+                    date_matches = re.findall(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+(\d{4})\b", full_pdf_text, re.IGNORECASE)
+                    if date_matches:
+                        month_label = f"{date_matches[0][0].capitalize()} {date_matches[0][1]}"
+                    else:
+                        num_dates = re.findall(r"\b(\d{2})[/-](\d{2})[/-](\d{4})\b", full_pdf_text)
+                        if num_dates:
+                            dt = pd.to_datetime(f"{num_dates[0][2]}-{num_dates[0][0]}-{num_dates[0][1]}")
+                            month_label = dt.strftime("%b %Y")
             except Exception:
                 month_label = file_name[:15]
 
             start_bal, stated_credits, stated_debits, end_bal = 0.0, 0.0, 0.0, 0.0
 
-            # 1. Parse Summary Box Totals
+            # --------------------------------------------------
+            # 1. BULLETPROOF SUMMARY BOX PARSER
+            # --------------------------------------------------
             if is_rbc:
-                open_m = re.search(r"Opening balance(?: on [A-Za-z]+\s+\d{1,2},\s+\d{4})?\s+\$?([\d,]+\.\d{2})", full_pdf_text, re.IGNORECASE)
-                cred_m = re.search(r"Total deposits & credits \(\d+\)\s+\+?\s*\$?([\d,]+\.\d{2})", full_pdf_text, re.IGNORECASE)
-                deb_m = re.search(r"Total cheques & debits \(\d+\)\s+-?\s*\$?([\d,]+\.\d{2})", full_pdf_text, re.IGNORECASE)
-                close_m = re.search(r"Closing balance(?: on [A-Za-z]+\s+\d{1,2},\s+\d{4})?\s*=\s*\$?([\d,]+\.\d{2})", full_pdf_text, re.IGNORECASE)
+                open_m = re.search(r"Opening\s+balance[^\d]*?([\d,]+\.\d{2})", full_pdf_text, re.IGNORECASE)
+                cred_m = re.search(r"Total\s+deposits\s*&\s*credits\s*\(\d+\)[^\d]*?([\d,]+\.\d{2})", full_pdf_text, re.IGNORECASE)
+                deb_m = re.search(r"Total\s+cheques\s*&\s*debits\s*\(\d+\)[^\d]*?([\d,]+\.\d{2})", full_pdf_text, re.IGNORECASE)
+                close_m = re.search(r"Closing\s+balance[^\d]*?([\d,]+\.\d{2})", full_pdf_text, re.IGNORECASE)
 
                 if open_m: start_bal = float(open_m.group(1).replace(",", ""))
                 if cred_m: stated_credits = float(cred_m.group(1).replace(",", ""))
@@ -109,21 +125,26 @@ def parse_uploaded_pdfs(files_data):
                 if close_m: end_bal = float(close_m.group(1).replace(",", ""))
 
             elif is_scotia:
-                sum_m = re.search(r"Account Summary for this Period:.*?\n\s*(\d+)\s+\$?([\d,]+\.\d{2})\s+(\d+)\s+\$?([\d,]+\.\d{2})", full_pdf_text, re.DOTALL | re.IGNORECASE)
+                sum_m = re.search(r"Account\s+Summary\s+for\s+this\s+Period:[\s\S]*?(\d+)\s+\$?([\d,]+\.\d{2})\s+(\d+)\s+\$?([\d,]+\.\d{2})", full_pdf_text, re.IGNORECASE)
                 if sum_m:
                     stated_debits = float(sum_m.group(2).replace(",", ""))
                     stated_credits = float(sum_m.group(4).replace(",", ""))
                 
-                bal_match = re.search(r"BALANCE FORWARD\s+([\d,]+\.\d{2})", full_pdf_upper)
+                bal_match = re.search(r"BALANCE\s+FORWARD\s+([\d,]+\.\d{2})", full_pdf_upper)
                 if bal_match: start_bal = float(bal_match.group(1).replace(",", ""))
                 
                 all_amounts = re.findall(r"\b\d[\d,]*\.\d{2}\b", full_pdf_text)
                 if all_amounts: end_bal = float(all_amounts[-1].replace(",", ""))
 
-            # 2. Analyze Line Items for Exclusions, NSF, and MCA
+            # --------------------------------------------------
+            # 2. SCAN ACTIVITY LINES FOR EXCLUSIONS, NSF, AND MCA
+            # --------------------------------------------------
             lines = [l.strip() for l in full_pdf_text.split("\n") if l.strip()]
             non_revenue_credits = 0.0
             file_nsf_count = 0
+
+            line_item_credits = 0.0
+            line_item_debits = 0.0
 
             for line in lines:
                 u = line.upper()
@@ -143,11 +164,11 @@ def parse_uploaded_pdfs(files_data):
                         elif not amts:
                             file_nsf_count += 1
 
-                # True Revenue Exclusions
+                # True Revenue Non-Sales Exclusions Engine
                 if any(excl in u for excl in REVENUE_EXCLUSIONS):
                     amts = [float(a.replace(",", "")) for a in re.findall(r"\b\d[\d,]*\.\d{2}\b", u)]
                     if amts:
-                        if any(kw in u for kw in ["BR TO BR", "ONLINE BANKING TRANSFER", "TRANSFER FROM", "EXPIRED INTERAC", "REFUND", "ERROR CORRECTION"]):
+                        if any(kw in u for kw in ["BR TO BR", "ONLINE BANKING TRANSFER", "TRANSFER FROM", "EXPIRED INTERAC", "REFUND", "ERROR CORRECTION", "FEE REVERSAL"]):
                             non_revenue_credits += amts[0]
                         elif "25,000.00" in u and "JOURNEY" in u:
                             non_revenue_credits += 25000.00
@@ -163,11 +184,26 @@ def parse_uploaded_pdfs(files_data):
                             mca_store[lender_name]["debit_count"] += 1
                             break
 
+                # Line-Item Fallback Aggregator for TD, BMO, CIBC, Chase, etc.
+                if stated_credits == 0.0 and stated_debits == 0.0:
+                    amts = [float(a.replace(",", "")) for a in re.findall(r"\b\d[\d,]*\.\d{2}\b", u)]
+                    if len(amts) >= 1:
+                        if any(c_kw in u for c_kw in ["DEPOSIT", "CREDIT MEMO", "AUTODEPOSIT"]):
+                            line_item_credits += amts[0]
+                        elif any(d_kw in u for d_kw in ["DEBIT", "WITHDRAWAL", "PURCHASE", "FEE", "SENT"]):
+                            line_item_debits += amts[0]
+
+            if stated_credits == 0.0 and line_item_credits > 0.0:
+                stated_credits = line_item_credits
+            if stated_debits == 0.0 and line_item_debits > 0.0:
+                stated_debits = line_item_debits
+
             true_revenue = max(0.0, stated_credits - non_revenue_credits)
 
             # Store Results
             monthly_store[month_label]["Start Balance"] = start_bal
             monthly_store[month_label]["Stated Credits"] += stated_credits
+            monthly_store[month_label]["Non-Revenue"] += non_revenue_credits
             monthly_store[month_label]["True Revenue"] += true_revenue
             monthly_store[month_label]["Stated Debits"] += stated_debits
             monthly_store[month_label]["End Balance"] = end_bal
@@ -192,7 +228,6 @@ total_nsf_count = 0
 detected_funder_positions = []
 
 if uploaded_files:
-    # Convert Streamlit UploadedFile objects to bytes payload
     files_payload = [(f.name, f.getvalue()) for f in uploaded_files]
     monthly_data_store, mca_tracker, warnings = parse_uploaded_pdfs(files_payload)
 
@@ -215,6 +250,7 @@ if uploaded_files:
                 "Month": month,
                 "Start Balance ($)": data["Start Balance"],
                 "Stated Credits ($)": data["Stated Credits"],
+                "Non-Rev Exclusions ($)": data["Non-Revenue"],
                 "True Revenue ($)": true_rev,
                 "Stated Debits ($)": st_debits,
                 "Debt %": debt_pct,
@@ -253,6 +289,7 @@ if uploaded_files:
             df_breakdown.style.format({
                 "Start Balance ($)": "${:,.2f}",
                 "Stated Credits ($)": "${:,.2f}",
+                "Non-Rev Exclusions ($)": "${:,.2f}",
                 "True Revenue ($)": "${:,.2f}",
                 "Stated Debits ($)": "${:,.2f}",
                 "Debt %": "{:.1f}%",
