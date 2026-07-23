@@ -7,7 +7,7 @@ from collections import defaultdict
 st.set_page_config(page_title="MCA Bank Parser & Underwriting Tool", page_icon="💳", layout="wide")
 
 st.title("💳 MCA Statement Analyzer & Underwriting Engine")
-st.caption("Upload bank statements. Extracts multi-line transactions, isolates true revenue from internal transfers, detects MCA positions, and calculates NSF risk.")
+st.caption("Upload bank statements. Extracts multi-line transactions, isolates true revenue, compares debits to true revenue, and checks NSF risk.")
 st.divider()
 
 # --- LENDER DICTIONARY WITH ALIASES & TIERS ---
@@ -48,7 +48,6 @@ NSF_KEYWORDS = [
     "OVERDRAWN HANDLING CHGS", "OVERDRAWN", "OVERDRAFT INTEREST CHG"
 ]
 
-# Headers & Footers to completely ignore
 JUNK_LINES = [
     "P.O. BOX", "AMHERST NS", "STATEMENT OF:", "BUSINESS ACCOUNT", "ACCOUNT DETAILS:", 
     "ACCOUNT SUMMARY", "UNCOLLECTED FEES", "PLEASE EXAMINE", "THIS IS YOUR OFFICIAL", 
@@ -57,7 +56,6 @@ JUNK_LINES = [
     "DEPOSITS/CREDITS", "NO. OF DEBITS", "EQUIFAX", "CREDIT PORTFOLIO INSIGHTS", "FICO SCORE"
 ]
 
-# Strict exclusions for True Revenue (Internal transfers, refunds, corrections, loans)
 REVENUE_EXCLUSIONS = [
     "INTERNAL TRANSFER", "TRANSFER FROM", "TRSF FROM", "MEMO TRANSFER", "ACCOUNT TRANSFER", 
     "MB-TRANSFER", "LOAN", "BDC HASCAP", "LINE OF CREDIT", "LOC DRAW", "CASH ADVANCE", 
@@ -67,10 +65,7 @@ REVENUE_EXCLUSIONS = [
 for f_data in KNOWN_FUNDERS.values():
     REVENUE_EXCLUSIONS.extend(f_data["keywords"])
 
-# Flexible date matcher (MM/DD/YYYY, YYYY-MM-DD, DD-MMM-YYYY, MM/DD/YY)
 DATE_REGEX = r"^(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2}|\d{2}-[A-Za-z]{3}-\d{4}|\d{2}/\d{2}/\d{2})"
-
-# Improved Amount Matcher: Handles numbers with OR without thousands-separating commas (e.g., 2176.62 or 2,176.62)
 AMOUNT_REGEX = r"(?:^|\s)\$?(\d[\d,]*\.\d{2}-?)(?=\s|$)"
 
 # --- SECTION 1: BANK STATEMENT PDF UPLOADER ---
@@ -99,7 +94,7 @@ if uploaded_files:
 
     for pdf_file in uploaded_files:
         with pdfplumber.open(pdf_file) as pdf:
-            # Document Guardrail: Ensure this is a bank statement, not a credit report or invoice
+            # Guardrail: Ignore credit reports / non-bank documents
             full_pdf_text = " ".join([(p.extract_text() or "") for p in pdf.pages]).upper()
             if "EQUIFAX" in full_pdf_text or "CREDIT PORTFOLIO INSIGHTS" in full_pdf_text:
                 st.warning(f"⚠️ Skipped non-bank statement document: **{pdf_file.name}** (Credit Report Detected)")
@@ -114,22 +109,20 @@ if uploaded_files:
                 
                 lines = [l.strip() for l in text.split("\n") if l.strip()]
                 
-                # Page Guardrail: Skip service charge summary detail pages
+                # Skip fee breakdown page
                 if any("SERVICE CHARGE" in line.upper() for line in lines) and any("SBAP MONTHLY FEE" in line.upper() for line in lines):
                     continue
                 
                 for line in lines:
                     upper_line = line.upper()
                     
-                    # 1. Ignore headers, footers, and summary boxes
                     if any(junk in upper_line for junk in JUNK_LINES):
                         continue
-                    if re.search(r"^\d+\s+of\s+\d+", line, re.IGNORECASE): # e.g. "1 of 3"
+                    if re.search(r"^\d+\s+of\s+\d+", line, re.IGNORECASE):
                         continue
-                    if re.search(r"^\d+\s+\$?[\d,]+\.\d{2}\s+\d+\s+\$?[\d,]+\.\d{2}", line): # Page summary totals
+                    if re.search(r"^\d+\s+\$?[\d,]+\.\d{2}\s+\d+\s+\$?[\d,]+\.\d{2}", line):
                         continue
 
-                    # 2. Block transactions by Date Trigger
                     if re.match(DATE_REGEX, line):
                         if current_tx:
                             transactions.append(" ".join(current_tx))
@@ -140,11 +133,10 @@ if uploaded_files:
             if current_tx:
                 transactions.append(" ".join(current_tx))
 
-            # 3. Process Isolated Transaction Blocks
+            # Process Transaction Blocks
             for tx in transactions:
                 tx_upper = tx.upper()
                 
-                # Clean trailing footer text if attached to bottom transaction
                 for disclaimer in ["TERMS AND CONDITIONS", "PLEASE EXAMINE", "BE PAYABLE BY"]:
                     if disclaimer in tx_upper:
                         tx_upper = tx_upper.split(disclaimer)[0].strip()
@@ -156,7 +148,7 @@ if uploaded_files:
                 raw_date_str = date_match.group(1)
                 try:
                     parsed_dt = pd.to_datetime(raw_date_str, format='mixed', dayfirst=False)
-                    month_label = parsed_dt.strftime("%b %Y")  # e.g., "May 2026"
+                    month_label = parsed_dt.strftime("%b %Y")
                 except Exception:
                     continue
 
@@ -170,7 +162,6 @@ if uploaded_files:
                 
                 if not amounts: continue
 
-                # Handle Starting/Opening Balances
                 if "BALANCE FORWARD" in tx_upper or "OPENING BALANCE" in tx_upper:
                     running_balance = amounts[-1]
                     if monthly_data_store[month_label]["Start Balance"] == 0.0:
@@ -188,7 +179,7 @@ if uploaded_files:
                 is_credit = False
                 is_debit = False
 
-                # 4. Balance Math Proof Engine
+                # Balance Proof Engine
                 if running_balance is not None and balance_amount is not None:
                     diff = round(balance_amount - running_balance, 2)
                     for amt in amounts[:-1]:
@@ -201,7 +192,7 @@ if uploaded_files:
                             primary_amount = amt
                             break
 
-                # Text Fallback Logic
+                # Text Fallback
                 if not is_credit and not is_debit:
                     primary_amount = amounts[-2] if len(amounts) >= 2 else amounts[0]
                     if any(kw in tx_upper for kw in ["CREDIT", "DEPOSIT", "INCOMING", "E-TRANSFER", "PAYABLE", "RTN WIRE", "ERROR CORRECTION", "REFUND"]):
@@ -209,7 +200,6 @@ if uploaded_files:
                     elif any(kw in tx_upper for kw in ["DEBIT", "PAYMENT", "PAD", "WITHDRAWAL", "FEE", "OUTGOING", "CHQ", "CHEQUE", "CHARGE", "LEASE", "PURCHASE"]):
                         is_debit = True
 
-                # Categorize Amounts
                 if is_credit:
                     monthly_data_store[month_label]["Stated Credits"] += primary_amount
                     if not any(excl in tx_upper for excl in REVENUE_EXCLUSIONS):
@@ -218,9 +208,11 @@ if uploaded_files:
                 elif is_debit:
                     monthly_data_store[month_label]["Stated Debits"] += primary_amount
                     
+                    # NSF Check: ONLY count if NSF keyword exists AND fee is >= $20.00
                     if any(kw in tx_upper for kw in NSF_KEYWORDS):
-                        monthly_data_store[month_label]["NSF Count"] += 1
-                        total_nsf_count += 1
+                        if primary_amount >= 20.0:
+                            monthly_data_store[month_label]["NSF Count"] += 1
+                            total_nsf_count += 1
                         
                     for lender_name, meta in KNOWN_FUNDERS.items():
                         if any(kw in tx_upper for kw in meta["keywords"]):
@@ -232,7 +224,7 @@ if uploaded_files:
                     running_balance = balance_amount
                     monthly_data_store[month_label]["End Balance"] = balance_amount
 
-    # Build Final Summary Output Tables
+    # Build Final Tables & Debt % Calculation
     num_active_months = max(1, len(monthly_data_store))
     chart_data = []
     total_true_revenue = 0.0
@@ -240,18 +232,23 @@ if uploaded_files:
     total_stated_debits = 0.0
     
     for month, data in monthly_data_store.items():
+        true_rev = data["True Revenue"]
+        st_debits = data["Stated Debits"]
+        debt_pct = (st_debits / true_rev * 100) if true_rev > 0 else 0.0
+        
         chart_data.append({
             "Month": month,
             "Start Balance ($)": data["Start Balance"],
             "Stated Credits ($)": data["Stated Credits"],
-            "True Revenue ($)": data["True Revenue"],
-            "Stated Debits ($)": data["Stated Debits"],
-            "NSF Fees": data["NSF Count"],
+            "True Revenue ($)": true_rev,
+            "Stated Debits ($)": st_debits,
+            "Debt %": debt_pct,
+            "NSF Fees (≥$20)": data["NSF Count"],
             "End Balance ($)": data["End Balance"]
         })
-        total_true_revenue += data["True Revenue"]
+        total_true_revenue += true_rev
         total_stated_credits += data["Stated Credits"]
-        total_stated_debits += data["Stated Debits"]
+        total_stated_debits += st_debits
 
     df_breakdown = pd.DataFrame(chart_data)
     auto_monthly_revenue = total_true_revenue / num_active_months
@@ -259,7 +256,7 @@ if uploaded_files:
     avg_monthly_debits = total_stated_debits / num_active_months
     avg_nsf_per_month = total_nsf_count / num_active_months
 
-    # Evaluate MCA Funder Frequency & Monthly Impact
+    # Evaluate MCA Funder Frequency
     for lender, data in mca_tracker.items():
         avg_debits_per_month = data["debit_count"] / num_active_months
         freq = "Daily" if avg_debits_per_month > 8 else "Weekly"
@@ -282,17 +279,30 @@ if uploaded_files:
             "Stated Credits ($)": "${:,.2f}",
             "True Revenue ($)": "${:,.2f}",
             "Stated Debits ($)": "${:,.2f}",
+            "Debt %": "{:.1f}%",
             "End Balance ($)": "${:,.2f}",
-            "NSF Fees": "{:,.0f}"
+            "NSF Fees (≥$20)": "{:,.0f}"
         }), 
         use_container_width=True, hide_index=True
     )
 
-    # Deposits vs True Revenue Bar Chart
-    st.markdown("### 📈 Stated Deposits vs. True Revenue Comparison")
+    # Visual Comparison: Stated Debits vs True Revenue + Debt % Callouts
+    st.markdown("### 📈 Stated Debits vs. True Revenue Comparison")
     if not df_breakdown.empty:
-        chart_df = df_breakdown.set_index("Month")[["Stated Credits ($)", "True Revenue ($)"]]
+        chart_df = df_breakdown.set_index("Month")[["Stated Debits ($)", "True Revenue ($)"]]
         st.bar_chart(chart_df)
+
+        # Monthly Debt % Summary Cards
+        st.markdown("#### 💡 Monthly Debt-to-Revenue Ratio Breakdown")
+        m_cols = st.columns(min(len(df_breakdown), 6))
+        for idx, row in df_breakdown.iterrows():
+            with m_cols[idx % len(m_cols)]:
+                st.metric(
+                    label=f"{row['Month']} Debt %",
+                    value=f"{row['Debt %']:.1f}%",
+                    delta=f"${row['Stated Debits ($)']:,.0f} Debits",
+                    delta_color="off"
+                )
 
     st.markdown("### 📌 Multi-Month Overview & Averages")
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -300,7 +310,7 @@ if uploaded_files:
     c2.metric("Avg Monthly Deposits", f"${avg_monthly_credits:,.2f}", f"${total_stated_credits:,.2f} Total")
     c3.metric("Avg True Monthly Rev", f"${auto_monthly_revenue:,.2f}", f"${total_true_revenue:,.2f} Total")
     c4.metric("Avg Monthly Debits", f"${avg_monthly_debits:,.2f}", f"${total_stated_debits:,.2f} Total")
-    c5.metric("NSF Fees", f"{total_nsf_count} Total", f"{avg_nsf_per_month:.1f} / mo", delta_color="inverse" if total_nsf_count > 0 else "normal")
+    c5.metric("NSF Fees (≥$20)", f"{total_nsf_count} Total", f"{avg_nsf_per_month:.1f} / mo", delta_color="inverse" if total_nsf_count > 0 else "normal")
 
 st.divider()
 
@@ -391,12 +401,12 @@ risk_multiplier = 1.0
 if 'avg_nsf_per_month' in locals():
     if avg_nsf_per_month > 3.0:
         risk_multiplier *= 0.70
-        risk_reasons.append(f"NSF Fee Risk: High ({total_nsf_count} total, {avg_nsf_per_month:.1f}/mo — 30% penalty)")
+        risk_reasons.append(f"NSF Fee Risk: High ({total_nsf_count} total ≥$20, {avg_nsf_per_month:.1f}/mo — 30% penalty)")
     elif avg_nsf_per_month > 1.0:
         risk_multiplier *= 0.85
-        risk_reasons.append(f"NSF Fee Risk: Moderate ({total_nsf_count} total, {avg_nsf_per_month:.1f}/mo — 15% penalty)")
+        risk_reasons.append(f"NSF Fee Risk: Moderate ({total_nsf_count} total ≥$20, {avg_nsf_per_month:.1f}/mo — 15% penalty)")
     else:
-        risk_reasons.append(f"NSF Fee Risk: Clean Record ({total_nsf_count} total fees — No penalty)")
+        risk_reasons.append(f"NSF Fee Risk: Clean Record ({total_nsf_count} total fees ≥$20 — No penalty)")
 
 if credit_score < 580:
     risk_multiplier *= 0.65
