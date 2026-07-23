@@ -7,7 +7,7 @@ from collections import defaultdict
 st.set_page_config(page_title="MCA Bank Parser & Underwriting Tool", page_icon="💳", layout="wide")
 
 st.title("💳 MCA Statement Analyzer & Underwriting Engine")
-st.caption("Upload bank statements (individual or merged). The engine forces visual layout parsing, handles trailing negative balances, and math-proofs true revenue.")
+st.caption("Upload bank statements. The engine groups multi-line transactions, handles trailing negative balances, ignores summary boxes, and math-proofs true revenue.")
 st.divider()
 
 # --- LENDER DICTIONARY WITH ALIASES & TIERS ---
@@ -45,8 +45,15 @@ KNOWN_FUNDERS = {
 MONTH_MAP = {"01": "Jan", "02": "Feb", "03": "Mar", "04": "Apr", "05": "May", "06": "Jun", 
              "07": "Jul", "08": "Aug", "09": "Sep", "10": "Oct", "11": "Nov", "12": "Dec"}
 
-NSF_KEYWORDS = ["NSF FEE", "NSF CHARGE", "NON-SUFFICIENT FEE", "OVERDRAFT FEE", "RETURNED ITEM FEE", "OVERDRAWN HANDLING"]
-JUNK_HEADERS = ["SCOTIABANK", "STATEMENT OF", "ACCOUNT NUMBER", "NO. OF DEBITS", "TOTAL AMOUNT", "PAGE ", "UNCOLLECTED FEES", "PLEASE EXAMINE", "GST REGISTRATION", "REGISTERED TRADEMARK", "TRANSACTION FEES", "SUB TOTAL", "SERVICE CHARGE SUMMARY", "DEPOSIT CONTENTS", "TRANSACTIONS OVER PLAN"]
+NSF_KEYWORDS = ["NSF FEE", "NSF CHARGE", "NON-SUFFICIENT", "OVERDRAFT", "RETURNED ITEM", "OVERDRAWN"]
+
+# Explicitly ignore Bank Summary boxes and page headers so they don't pollute the math
+JUNK_LINES = [
+    "ACCOUNT SUMMARY", "TOTAL AMOUNT", "NO. OF DEBITS", "NO. OF CREDITS", 
+    "ITEM VOLUME", "TOTAL SERVICE CHARGES", "UNCOLLECTED FEES", "PLEASE EXAMINE", 
+    "GST REGISTRATION", "REGISTERED TRADEMARK", "ACCOUNT DETAILS", 
+    "WITHDRAWALS/DEBITS", "DEPOSITS/CREDITS", "BALANCE ($)", "STATEMENT OF"
+]
 
 # Strict exclusions for True Revenue
 REVENUE_EXCLUSIONS = [
@@ -69,6 +76,7 @@ uploaded_files = st.file_uploader(
 auto_monthly_revenue = 0.0
 total_nsf_count = 0
 detected_funder_positions = []
+
 monthly_data_store = defaultdict(lambda: {
     "Start Balance": 0.0, "Stated Credits": 0.0, "True Revenue": 0.0, 
     "Stated Debits": 0.0, "End Balance": 0.0, "NSF Count": 0
@@ -76,7 +84,7 @@ monthly_data_store = defaultdict(lambda: {
 mca_tracker = defaultdict(lambda: {"total_amount": 0.0, "debit_count": 0})
 
 if uploaded_files:
-    st.info("📁 **Processing Documents...** Running mathematical balance proofs and isolating true revenue.")
+    st.info("📁 **Processing Documents...** Building transaction blocks and running mathematical proofs.")
     
     running_balance = None
 
@@ -86,53 +94,56 @@ if uploaded_files:
             current_tx = []
             
             for page in pdf.pages:
-                # Force Visual Layout parsing to prevent column merging
-                text = page.extract_text(layout=True)
+                text = page.extract_text()
                 if not text: continue
                 
-                for line in text.split("\n"):
+                lines = text.split("\n")
+                for line in lines:
                     line_clean = line.strip()
                     if not line_clean: continue
                     
                     upper_line = line_clean.upper()
-                    if any(junk in upper_line for junk in JUNK_HEADERS):
-                        continue
                     
+                    # 1. Skip all bank summary headers and footers to prevent artificial inflation
+                    if any(junk in upper_line for junk in JUNK_LINES):
+                        continue
+                        
+                    # 2. Block transactions by Date
                     if re.match(r"^\d{2}/\d{2}/\d{4}", line_clean):
                         if current_tx:
                             transactions.append(" ".join(current_tx))
                         current_tx = [line_clean]
                     elif current_tx:
+                        # Append sub-lines (descriptions) to the current transaction block
+                        if "SCOTIABANK" in upper_line or "P.O. BOX" in upper_line or "PAGE " in upper_line:
+                            continue
                         current_tx.append(line_clean)
             
             if current_tx:
                 transactions.append(" ".join(current_tx))
 
+            # 3. Process the safely isolated transaction blocks
             for tx in transactions:
                 tx_upper = tx.upper()
+                
                 month_str = tx[:2]
                 month_label = MONTH_MAP.get(month_str, "Unknown")
                 if month_label == "Unknown": continue
 
-                # Regex captures dollar amounts, including trailing minus signs (e.g. 377.24-)
-                raw_amounts = re.findall(r"(?<!\S)\$?\d{1,3}(?:[.,]\d{3})*(?:\.\d{2})?-?(?!\S)", tx_upper)
+                # Strict Regex: Only pull valid currency formats, explicitly capturing trailing minus signs
+                raw_amounts = re.findall(r"(?:^|\s)\$?(\d{1,3}(?:,\d{3})*\.\d{2}-?)(?=\s|$)", tx_upper)
                 
                 amounts = []
                 for a in raw_amounts:
-                    clean_a = a.replace("$", "").replace(",", "")
-                    # Move trailing minus to the front for Python math
+                    clean_a = a.replace(",", "")
+                    # Convert trailing minus (e.g. 377.24-) into a leading minus for Python math
                     if clean_a.endswith("-"):
                         clean_a = "-" + clean_a[:-1]
-                    
-                    if clean_a.count(".") > 1:
-                        parts = clean_a.rsplit(".", 1)
-                        clean_a = parts[0].replace(".", "") + "." + parts[1]
-                        
                     amounts.append(float(clean_a))
                 
                 if not amounts: continue
 
-                # Handle Start Balance strictly
+                # Handle Starting Balances
                 if "BALANCE FORWARD" in tx_upper or "OPENING BALANCE" in tx_upper:
                     running_balance = amounts[-1]
                     if monthly_data_store[month_label]["Start Balance"] == 0.0:
@@ -150,30 +161,30 @@ if uploaded_files:
                 is_credit = False
                 is_debit = False
 
-                # MATHEMATICAL PROOF ENGINE
+                # 4. Mathematical Proof Engine
                 if running_balance is not None and balance_amount is not None:
                     diff = round(balance_amount - running_balance, 2)
                     
-                    # Scan all extracted numbers to find the exact transaction amount
+                    # Scan the line's amounts to see which one mathematically caused the balance change
                     for amt in amounts[:-1]:
-                        if abs(diff - amt) < 0.10:
+                        if abs(diff - amt) < 0.05:
                             is_credit = True
                             primary_amount = amt
                             break
-                        elif abs(diff - (-amt)) < 0.10:
+                        elif abs(diff - (-amt)) < 0.05:
                             is_debit = True
                             primary_amount = amt
                             break
 
-                # Text Fallback if math fails
+                # Text Fallback
                 if not is_credit and not is_debit:
                     primary_amount = amounts[-2] if len(amounts) >= 2 else amounts[0]
                     if any(kw in tx_upper for kw in ["CREDIT", "DEPOSIT", "INCOMING", "E-TRANSFER", "PAYABLE", "RTN WIRE"]):
                         is_credit = True
-                    elif any(kw in tx_upper for kw in ["DEBIT", "PAYMENT", "PAD", "WITHDRAWAL", "FEE", "OUTGOING", "CHQ", "CHEQUE", "SERVICE CHARGE", "LEASE"]):
+                    elif any(kw in tx_upper for kw in ["DEBIT", "PAYMENT", "PAD", "WITHDRAWAL", "FEE", "OUTGOING", "CHQ", "CHEQUE", "CHARGE", "LEASE", "PURCHASE"]):
                         is_debit = True
 
-                # DATA ALLOCATION
+                # 5. Categorize the extracted, math-proofed figures
                 if is_credit:
                     monthly_data_store[month_label]["Stated Credits"] += primary_amount
                     if not any(excl in tx_upper for excl in REVENUE_EXCLUSIONS):
@@ -193,12 +204,12 @@ if uploaded_files:
                             mca_tracker[lender_name]["debit_count"] += 1
                             break 
                 
-                # Resync running balance for the next line's math proof
+                # Sync balance for the next transaction line
                 if balance_amount is not None and (is_credit or is_debit):
                     running_balance = balance_amount
                     monthly_data_store[month_label]["End Balance"] = balance_amount
 
-    # Prepare Chart Output Data
+    # Build Final Output Tables
     num_active_months = max(1, len(monthly_data_store))
     chart_data = []
     total_true_revenue = 0.0
@@ -219,7 +230,7 @@ if uploaded_files:
     auto_monthly_revenue = total_true_revenue / num_active_months
     avg_nsf_per_month = total_nsf_count / num_active_months
 
-    # Process MCA Positions
+    # Evaluate MCA Funder Frequency
     for lender, data in mca_tracker.items():
         avg_debits_per_month = data["debit_count"] / num_active_months
         freq = "Daily" if avg_debits_per_month > 8 else "Weekly"
@@ -272,7 +283,6 @@ with col_left:
     st.markdown("#### Detected Debt Positions")
     st.caption("Funder, frequency, and payment amount dynamically calculated from statement history.")
 
-    # Forced session state override on new document upload
     if "upload_count" not in st.session_state or (uploaded_files and st.session_state.upload_count != len(uploaded_files)):
         if detected_funder_positions:
             st.session_state.positions = []
