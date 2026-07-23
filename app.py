@@ -1,8 +1,8 @@
 import streamlit as st
-import pdfplumber
 import pandas as pd
 import re
 from collections import defaultdict
+from pypdf import PdfReader  # Lightweight, high-speed PDF reader
 
 st.set_page_config(page_title="MCA Bank Parser & Underwriting Tool", page_icon="💳", layout="wide")
 
@@ -42,84 +42,57 @@ KNOWN_FUNDERS = {
     "TFG Financial": {"tier": "Standard", "keywords": ["TFG FINANCIAL", "TFG FINANCIAL CORPORATION"]}
 }
 
-# Non-revenue keywords to exclude from True Revenue
 REVENUE_EXCLUSIONS = [
     "INTERNAL TRANSFER", "TRANSFER FROM", "TRSF FROM", "MEMO TRANSFER", "ACCOUNT TRANSFER", 
     "MB-TRANSFER", "BR TO BR", "ONLINE BANKING TRANSFER", "LOAN", "BDC HASCAP", "LINE OF CREDIT", 
     "LOC DRAW", "CASH ADVANCE", "ADVANCE PROCEEDS", "REVERSAL", "REFUND", "RETURNED ITEM", 
     "RTN WIRE", "PAYROLL", "ERROR CORRECTION", "EXPIRED INTERAC", "UNITED TRADING", "ACCOUNTS PAYABLE"
 ]
-for f_data in KNOWN_FUNDERS.values():
-    REVENUE_EXCLUSIONS.extend(f_data["keywords"])
 
-# Regex for various date formats (including RBC '29 Dec' or '02 Jan')
-DATE_REGEX_UNIVERSAL = r"^(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2}|\d{2}-[A-Za-z]{3}-\d{4}|\d{2}/\d{2}/\d{2}|\d{2}\s+[A-Za-z]{3})"
+# --- CACHED PDF PARSING ENGINE (PREVENTS RE-PARSING CRASHES) ---
+@st.cache_data(show_spinner="📄 Processing and analyzing uploaded statements...")
+def parse_uploaded_pdfs(files_data):
+    monthly_store = defaultdict(lambda: {
+        "Start Balance": 0.0, "Stated Credits": 0.0, "True Revenue": 0.0, 
+        "Stated Debits": 0.0, "End Balance": 0.0, "NSF Count": 0
+    })
+    mca_store = defaultdict(lambda: {"total_amount": 0.0, "debit_count": 0})
+    warnings = []
 
-# --- SECTION 1: BANK STATEMENT PDF UPLOADER ---
-st.subheader("1. Bank Statement Ingestion & Month-by-Month Analysis")
-
-uploaded_files = st.file_uploader(
-    "Upload Bank Statements (PDFs)", 
-    type=["pdf"], 
-    accept_multiple_files=True
-)
-
-auto_monthly_revenue = 0.0
-total_nsf_count = 0
-detected_funder_positions = []
-
-monthly_data_store = defaultdict(lambda: {
-    "Start Balance": 0.0, "Stated Credits": 0.0, "True Revenue": 0.0, 
-    "Stated Debits": 0.0, "End Balance": 0.0, "NSF Count": 0
-})
-mca_tracker = defaultdict(lambda: {"total_amount": 0.0, "debit_count": 0})
-
-if uploaded_files:
-    st.info("📁 **Processing Documents...** Running Multi-Bank Ingestion and Extracting Figures.")
-
-    for pdf_file in uploaded_files:
-        with pdfplumber.open(pdf_file) as pdf:
+    for file_name, file_bytes in files_data:
+        try:
+            reader = PdfReader(file_bytes)
             full_pdf_text = ""
-            pages_text = []
-            for page in pdf.pages:
-                t = page.extract_text() or ""
-                pages_text.append(t)
-                full_pdf_text += t + "\n"
+            for page in reader.pages:
+                full_pdf_text += (page.extract_text() or "") + "\n"
 
             full_pdf_upper = full_pdf_text.upper()
 
-            # Document Guardrail: Skip Equifax / Credit Reports
+            # Guardrail: Skip Non-Bank Documents
             if "EQUIFAX" in full_pdf_upper or "CREDIT PORTFOLIO INSIGHTS" in full_pdf_upper:
-                st.warning(f"⚠️ Skipped non-bank document: **{pdf_file.name}** (Credit Report Detected)")
+                warnings.append(f"Skipped non-bank statement: **{file_name}** (Credit Report Detected)")
                 continue
 
-            # Identify Bank Type
             is_rbc = "ROYAL BANK OF CANADA" in full_pdf_upper or "RBC" in full_pdf_upper
             is_scotia = "SCOTIABANK" in full_pdf_upper or "BANK OF NOVA SCOTIA" in full_pdf_upper
 
-            # Extract Month Label
+            # Extract Month Label safely
             month_label = "Unknown Month"
-            if is_rbc:
-                period_match = re.search(r"([A-Za-z]+\s+\d{1,2},\s+\d{4})\s+to\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})", full_pdf_text)
-                if period_match:
-                    month_label = pd.to_datetime(period_match.group(2)).strftime("%b %Y")
-            elif is_scotia:
-                period_match = re.search(r"(\b[A-Za-z]{3}\s+\d{1,2}\s+\d{4}\b)\s+(\b[A-Za-z]{3}\s+\d{1,2}\s+\d{4}\b)", full_pdf_text)
-                if period_match:
-                    month_label = pd.to_datetime(period_match.group(2)).strftime("%b %Y")
-            else:
-                period_match = re.search(r"(\d{2}/\d{2}/\d{4})", full_pdf_text)
-                if period_match:
-                    month_label = pd.to_datetime(period_match.group(1)).strftime("%b %Y")
+            try:
+                if is_rbc:
+                    period_match = re.search(r"([A-Za-z]+\s+\d{1,2},\s+\d{4})\s+to\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})", full_pdf_text)
+                    if period_match:
+                        month_label = pd.to_datetime(period_match.group(2)).strftime("%b %Y")
+                elif is_scotia:
+                    period_match = re.search(r"(\b[A-Za-z]{3}\s+\d{1,2}\s+\d{4}\b)\s+(\b[A-Za-z]{3}\s+\d{1,2}\s+\d{4}\b)", full_pdf_text)
+                    if period_match:
+                        month_label = pd.to_datetime(period_match.group(2)).strftime("%b %Y")
+            except Exception:
+                month_label = file_name[:15]
 
-            start_bal = 0.0
-            stated_credits = 0.0
-            stated_debits = 0.0
-            end_bal = 0.0
+            start_bal, stated_credits, stated_debits, end_bal = 0.0, 0.0, 0.0, 0.0
 
-            # --------------------------------------------------
-            # 1. PARSE SUMMARY BOXES FOR EXACT STATED TOTALS
-            # --------------------------------------------------
+            # 1. Parse Summary Box Totals
             if is_rbc:
                 open_m = re.search(r"Opening balance(?: on [A-Za-z]+\s+\d{1,2},\s+\d{4})?\s+\$?([\d,]+\.\d{2})", full_pdf_text, re.IGNORECASE)
                 cred_m = re.search(r"Total deposits & credits \(\d+\)\s+\+?\s*\$?([\d,]+\.\d{2})", full_pdf_text, re.IGNORECASE)
@@ -140,13 +113,10 @@ if uploaded_files:
                 bal_match = re.search(r"BALANCE FORWARD\s+([\d,]+\.\d{2})", full_pdf_upper)
                 if bal_match: start_bal = float(bal_match.group(1).replace(",", ""))
                 
-                # Find last transaction balance
                 all_amounts = re.findall(r"\b\d[\d,]*\.\d{2}\b", full_pdf_text)
                 if all_amounts: end_bal = float(all_amounts[-1].replace(",", ""))
 
-            # --------------------------------------------------
-            # 2. SCAN ACTIVITY LINES FOR EXCLUSIONS, NSF, MCA
-            # --------------------------------------------------
+            # 2. Analyze Line Items for Exclusions, NSF, and MCA
             lines = [l.strip() for l in full_pdf_text.split("\n") if l.strip()]
             non_revenue_credits = 0.0
             file_nsf_count = 0
@@ -154,7 +124,7 @@ if uploaded_files:
             for line in lines:
                 u = line.upper()
 
-                # NSF Fee Count Engine (>= $20.00)
+                # NSF Fee Detection (>= $20.00)
                 if any(kw in u for kw in ["NSF ITEM FEE", "OVERDRAWN HANDLING CHGS", "NSF FEE", "NON-SUFFICIENT"]):
                     multi_match = re.search(r"(\d+)\s*@\s*\$?(\d+\.\d{2})", u)
                     if multi_match:
@@ -169,128 +139,148 @@ if uploaded_files:
                         elif not amts:
                             file_nsf_count += 1
 
-                # True Revenue Non-Sales Exclusions Engine
+                # True Revenue Exclusions
                 if any(excl in u for excl in REVENUE_EXCLUSIONS):
-                    # Filter out line items matching non-revenue credit deposits
                     amts = [float(a.replace(",", "")) for a in re.findall(r"\b\d[\d,]*\.\d{2}\b", u)]
                     if amts:
-                        # Exclude funding/transfer credits
                         if any(kw in u for kw in ["BR TO BR", "ONLINE BANKING TRANSFER", "TRANSFER FROM", "EXPIRED INTERAC", "REFUND", "ERROR CORRECTION"]):
                             non_revenue_credits += amts[0]
-                        elif "25,000.00" in u and "JOURNEY" in u: # Exclude MCA advance deposit
+                        elif "25,000.00" in u and "JOURNEY" in u:
                             non_revenue_credits += 25000.00
 
                 # MCA Debits Detection
                 for lender_name, meta in KNOWN_FUNDERS.items():
                     if any(kw in u for kw in meta["keywords"]):
-                        if "25,000.00" in u and "JOURNEY" in u: # Ignore loan advance credit
+                        if "25,000.00" in u and "JOURNEY" in u:
                             continue
                         amts = [float(a.replace(",", "")) for a in re.findall(r"\b\d[\d,]*\.\d{2}\b", u)]
                         if amts:
-                            primary_amt = amts[0]
-                            mca_tracker[lender_name]["total_amount"] += primary_amt
-                            mca_tracker[lender_name]["debit_count"] += 1
+                            mca_store[lender_name]["total_amount"] += amts[0]
+                            mca_store[lender_name]["debit_count"] += 1
                             break
 
-            # Calculate True Revenue
             true_revenue = max(0.0, stated_credits - non_revenue_credits)
 
-            # Store extracted figures by Month
-            monthly_data_store[month_label]["Start Balance"] = start_bal
-            monthly_data_store[month_label]["Stated Credits"] += stated_credits
-            monthly_data_store[month_label]["True Revenue"] += true_revenue
-            monthly_data_store[month_label]["Stated Debits"] += stated_debits
-            monthly_data_store[month_label]["End Balance"] = end_bal
-            monthly_data_store[month_label]["NSF Count"] += file_nsf_count
-            total_nsf_count += file_nsf_count
+            # Store Results
+            monthly_store[month_label]["Start Balance"] = start_bal
+            monthly_store[month_label]["Stated Credits"] += stated_credits
+            monthly_store[month_label]["True Revenue"] += true_revenue
+            monthly_store[month_label]["Stated Debits"] += stated_debits
+            monthly_store[month_label]["End Balance"] = end_bal
+            monthly_store[month_label]["NSF Count"] += file_nsf_count
 
-    # Build Final Output Tables & Visuals
-    num_active_months = max(1, len(monthly_data_store))
-    chart_data = []
-    total_true_revenue = 0.0
-    total_stated_credits = 0.0
-    total_stated_debits = 0.0
+        except Exception as e:
+            warnings.append(f"Error reading file **{file_name}**: {str(e)}")
 
-    for month, data in monthly_data_store.items():
-        true_rev = data["True Revenue"]
-        st_debits = data["Stated Debits"]
-        debt_pct = (st_debits / true_rev * 100) if true_rev > 0 else 0.0
+    return dict(monthly_store), dict(mca_store), warnings
 
-        chart_data.append({
-            "Month": month,
-            "Start Balance ($)": data["Start Balance"],
-            "Stated Credits ($)": data["Stated Credits"],
-            "True Revenue ($)": true_rev,
-            "Stated Debits ($)": st_debits,
-            "Debt %": debt_pct,
-            "NSF Fees (≥$20)": data["NSF Count"],
-            "End Balance ($)": data["End Balance"]
-        })
-        total_true_revenue += true_rev
-        total_stated_credits += data["Stated Credits"]
-        total_stated_debits += st_debits
+# --- SECTION 1: BANK STATEMENT UPLOADER ---
+st.subheader("1. Bank Statement Ingestion & Month-by-Month Analysis")
 
-    df_breakdown = pd.DataFrame(chart_data)
-    auto_monthly_revenue = total_true_revenue / num_active_months
-    avg_monthly_credits = total_stated_credits / num_active_months
-    avg_monthly_debits = total_stated_debits / num_active_months
-    avg_nsf_per_month = total_nsf_count / num_active_months
+uploaded_files = st.file_uploader(
+    "Upload Bank Statements (PDFs)", 
+    type=["pdf"], 
+    accept_multiple_files=True
+)
 
-    # Evaluate MCA Funder Frequency
-    for lender, data in mca_tracker.items():
-        avg_debits_per_month = data["debit_count"] / num_active_months
-        freq = "Daily" if avg_debits_per_month > 8 else "Weekly"
-        divisor = 21.67 if freq == "Daily" else 4.33
+auto_monthly_revenue = 0.0
+total_nsf_count = 0
+detected_funder_positions = []
 
-        avg_monthly_impact = data["total_amount"] / num_active_months
-        payment_amount = avg_monthly_impact / divisor
+if uploaded_files:
+    # Convert uploaded files to Bytes to pass into cached function
+    files_payload = [(f.name, f.getvalue()) for f in uploaded_files]
+    monthly_data_store, mca_tracker, warnings = parse_uploaded_pdfs(files_payload)
 
-        detected_funder_positions.append({
-            "name": lender,
-            "amount": round(payment_amount, 2),
-            "freq": freq,
-            "monthly_avg": round(avg_monthly_impact, 2)
-        })
+    for w in warnings:
+        st.warning(f"⚠️ {w}")
 
-    st.markdown("### 📊 Extracted Monthly Financial Breakdown")
-    st.dataframe(
-        df_breakdown.style.format({
-            "Start Balance ($)": "${:,.2f}",
-            "Stated Credits ($)": "${:,.2f}",
-            "True Revenue ($)": "${:,.2f}",
-            "Stated Debits ($)": "${:,.2f}",
-            "Debt %": "{:.1f}%",
-            "End Balance ($)": "${:,.2f}",
-            "NSF Fees (≥$20)": "{:,.0f}"
-        }), 
-        use_container_width=True, hide_index=True
-    )
+    if monthly_data_store:
+        num_active_months = max(1, len(monthly_data_store))
+        chart_data = []
+        total_true_revenue = 0.0
+        total_stated_credits = 0.0
+        total_stated_debits = 0.0
 
-    # Visual Comparison Chart: Debits vs True Revenue
-    st.markdown("### 📈 Stated Debits vs. True Revenue Comparison")
-    if not df_breakdown.empty:
-        chart_df = df_breakdown.set_index("Month")[["Stated Debits ($)", "True Revenue ($)"]]
-        st.bar_chart(chart_df)
+        for month, data in monthly_data_store.items():
+            true_rev = data["True Revenue"]
+            st_debits = data["Stated Debits"]
+            debt_pct = (st_debits / true_rev * 100) if true_rev > 0 else 0.0
 
-        # Monthly Debt % Metrics Cards
-        st.markdown("#### 💡 Monthly Debt-to-Revenue Ratio Breakdown")
-        m_cols = st.columns(min(len(df_breakdown), 6))
-        for idx, row in df_breakdown.iterrows():
-            with m_cols[idx % len(m_cols)]:
-                st.metric(
-                    label=f"{row['Month']} Debt %",
-                    value=f"{row['Debt %']:.1f}%",
-                    delta=f"${row['Stated Debits ($)']:,.0f} Debits",
-                    delta_color="off"
-                )
+            chart_data.append({
+                "Month": month,
+                "Start Balance ($)": data["Start Balance"],
+                "Stated Credits ($)": data["Stated Credits"],
+                "True Revenue ($)": true_rev,
+                "Stated Debits ($)": st_debits,
+                "Debt %": debt_pct,
+                "NSF Fees (≥$20)": data["NSF Count"],
+                "End Balance ($)": data["End Balance"]
+            })
+            total_true_revenue += true_rev
+            total_stated_credits += data["Stated Credits"]
+            total_stated_debits += st_debits
+            total_nsf_count += data["NSF Count"]
 
-    st.markdown("### 📌 Multi-Month Overview & Averages")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Active Months", f"{num_active_months} Month(s)")
-    c2.metric("Avg Monthly Deposits", f"${avg_monthly_credits:,.2f}", f"${total_stated_credits:,.2f} Total")
-    c3.metric("Avg True Monthly Rev", f"${auto_monthly_revenue:,.2f}", f"${total_true_revenue:,.2f} Total")
-    c4.metric("Avg Monthly Debits", f"${avg_monthly_debits:,.2f}", f"${total_stated_debits:,.2f} Total")
-    c5.metric("NSF Fees (≥$20)", f"{total_nsf_count} Total", f"{avg_nsf_per_month:.1f} / mo", delta_color="inverse" if total_nsf_count > 0 else "normal")
+        df_breakdown = pd.DataFrame(chart_data)
+        auto_monthly_revenue = total_true_revenue / num_active_months
+        avg_monthly_credits = total_stated_credits / num_active_months
+        avg_monthly_debits = total_stated_debits / num_active_months
+        avg_nsf_per_month = total_nsf_count / num_active_months
+
+        # MCA Frequency Evaluation
+        for lender, data in mca_tracker.items():
+            avg_debits_per_month = data["debit_count"] / num_active_months
+            freq = "Daily" if avg_debits_per_month > 8 else "Weekly"
+            divisor = 21.67 if freq == "Daily" else 4.33
+
+            avg_monthly_impact = data["total_amount"] / num_active_months
+            payment_amount = avg_monthly_impact / divisor
+
+            detected_funder_positions.append({
+                "name": lender,
+                "amount": round(payment_amount, 2),
+                "freq": freq,
+                "monthly_avg": round(avg_monthly_impact, 2)
+            })
+
+        st.markdown("### 📊 Extracted Monthly Financial Breakdown")
+        st.dataframe(
+            df_breakdown.style.format({
+                "Start Balance ($)": "${:,.2f}",
+                "Stated Credits ($)": "${:,.2f}",
+                "True Revenue ($)": "${:,.2f}",
+                "Stated Debits ($)": "${:,.2f}",
+                "Debt %": "{:.1f}%",
+                "End Balance ($)": "${:,.2f}",
+                "NSF Fees (≥$20)": "{:,.0f}"
+            }), 
+            use_container_width=True, hide_index=True
+        )
+
+        st.markdown("### 📈 Stated Debits vs. True Revenue Comparison")
+        if not df_breakdown.empty:
+            chart_df = df_breakdown.set_index("Month")[["Stated Debits ($)", "True Revenue ($)"]]
+            st.bar_chart(chart_df)
+
+            st.markdown("#### 💡 Monthly Debt-to-Revenue Ratio Breakdown")
+            m_cols = st.columns(min(len(df_breakdown), 6))
+            for idx, row in df_breakdown.iterrows():
+                with m_cols[idx % len(m_cols)]:
+                    st.metric(
+                        label=f"{row['Month']} Debt %",
+                        value=f"{row['Debt %']:.1f}%",
+                        delta=f"${row['Stated Debits ($)']:,.0f} Debits",
+                        delta_color="off"
+                    )
+
+        st.markdown("### 📌 Multi-Month Overview & Averages")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Active Months", f"{num_active_months} Month(s)")
+        c2.metric("Avg Monthly Deposits", f"${avg_monthly_credits:,.2f}", f"${total_stated_credits:,.2f} Total")
+        c3.metric("Avg True Monthly Rev", f"${auto_monthly_revenue:,.2f}", f"${total_true_revenue:,.2f} Total")
+        c4.metric("Avg Monthly Debits", f"${avg_monthly_debits:,.2f}", f"${total_stated_debits:,.2f} Total")
+        c5.metric("NSF Fees (≥$20)", f"{total_nsf_count} Total", f"{avg_nsf_per_month:.1f} / mo", delta_color="inverse" if total_nsf_count > 0 else "normal")
 
 st.divider()
 
