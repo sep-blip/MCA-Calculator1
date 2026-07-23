@@ -7,7 +7,7 @@ from collections import defaultdict
 st.set_page_config(page_title="MCA Bank Parser & Underwriting Tool", page_icon="💳", layout="wide")
 
 st.title("💳 MCA Statement Analyzer & Underwriting Engine")
-st.caption("Upload bank statements (individual or merged). The engine isolates true revenue, proves deposits via balance math, and calculates MCA positions.")
+st.caption("Upload bank statements (individual or merged). The engine forces visual layout parsing, handles trailing negative balances, and math-proofs true revenue.")
 st.divider()
 
 # --- LENDER DICTIONARY WITH ALIASES & TIERS ---
@@ -45,8 +45,8 @@ KNOWN_FUNDERS = {
 MONTH_MAP = {"01": "Jan", "02": "Feb", "03": "Mar", "04": "Apr", "05": "May", "06": "Jun", 
              "07": "Jul", "08": "Aug", "09": "Sep", "10": "Oct", "11": "Nov", "12": "Dec"}
 
-NSF_KEYWORDS = ["NSF FEE", "NSF CHARGE", "NON-SUFFICIENT FEE", "OVERDRAFT FEE", "RETURNED ITEM FEE"]
-JUNK_HEADERS = ["SCOTIABANK", "APPLEWOOD VILLAGE", "MISSISSAUGA", "STATEMENT OF", "ACCOUNT NUMBER", "NO. OF DEBITS", "TOTAL AMOUNT", "PAGE ", "UNCOLLECTED FEES", "PLEASE EXAMINE", "GST REGISTRATION", "REGISTERED TRADEMARK", "TRANSACTION FEES", "SUB TOTAL", "SERVICE CHARGE SUMMARY"]
+NSF_KEYWORDS = ["NSF FEE", "NSF CHARGE", "NON-SUFFICIENT FEE", "OVERDRAFT FEE", "RETURNED ITEM FEE", "OVERDRAWN HANDLING"]
+JUNK_HEADERS = ["SCOTIABANK", "STATEMENT OF", "ACCOUNT NUMBER", "NO. OF DEBITS", "TOTAL AMOUNT", "PAGE ", "UNCOLLECTED FEES", "PLEASE EXAMINE", "GST REGISTRATION", "REGISTERED TRADEMARK", "TRANSACTION FEES", "SUB TOTAL", "SERVICE CHARGE SUMMARY", "DEPOSIT CONTENTS", "TRANSACTIONS OVER PLAN"]
 
 # Strict exclusions for True Revenue
 REVENUE_EXCLUSIONS = [
@@ -69,8 +69,6 @@ uploaded_files = st.file_uploader(
 auto_monthly_revenue = 0.0
 total_nsf_count = 0
 detected_funder_positions = []
-
-# Data store specifically for the Output Chart
 monthly_data_store = defaultdict(lambda: {
     "Start Balance": 0.0, "Stated Credits": 0.0, "True Revenue": 0.0, 
     "Stated Debits": 0.0, "End Balance": 0.0, "NSF Count": 0
@@ -87,9 +85,9 @@ if uploaded_files:
             transactions = []
             current_tx = []
             
-            # 1. Isolate strict transaction blocks, completely ignoring bank headers/footers
             for page in pdf.pages:
-                text = page.extract_text()
+                # Force Visual Layout parsing to prevent column merging
+                text = page.extract_text(layout=True)
                 if not text: continue
                 
                 for line in text.split("\n"):
@@ -100,7 +98,6 @@ if uploaded_files:
                     if any(junk in upper_line for junk in JUNK_HEADERS):
                         continue
                     
-                    # If line starts with MM/DD/YYYY, start a new transaction block
                     if re.match(r"^\d{2}/\d{2}/\d{4}", line_clean):
                         if current_tx:
                             transactions.append(" ".join(current_tx))
@@ -111,63 +108,72 @@ if uploaded_files:
             if current_tx:
                 transactions.append(" ".join(current_tx))
 
-            # 2. Process extracted transactions
             for tx in transactions:
                 tx_upper = tx.upper()
-                
                 month_str = tx[:2]
                 month_label = MONTH_MAP.get(month_str, "Unknown")
                 if month_label == "Unknown": continue
 
-                # Regex captures dollar amounts with or without decimals, ignoring long reference numbers
-                raw_amounts = re.findall(r"(?<!\S)\$?\d{1,3}(?:[.,]\d{3})*(?:\.\d{2})?(?!\S)", tx_upper)
+                # Regex captures dollar amounts, including trailing minus signs (e.g. 377.24-)
+                raw_amounts = re.findall(r"(?<!\S)\$?\d{1,3}(?:[.,]\d{3})*(?:\.\d{2})?-?(?!\S)", tx_upper)
                 
                 amounts = []
                 for a in raw_amounts:
                     clean_a = a.replace("$", "").replace(",", "")
-                    if clean_a.count(".") > 1: # Fixes OCR dot errors
+                    # Move trailing minus to the front for Python math
+                    if clean_a.endswith("-"):
+                        clean_a = "-" + clean_a[:-1]
+                    
+                    if clean_a.count(".") > 1:
                         parts = clean_a.rsplit(".", 1)
                         clean_a = parts[0].replace(".", "") + "." + parts[1]
+                        
                     amounts.append(float(clean_a))
                 
-                if not amounts:
-                    continue
+                if not amounts: continue
 
-                # Set Start Balance when explicitly stated
-                if "BALANCE FORWARD" in tx_upper:
+                # Handle Start Balance strictly
+                if "BALANCE FORWARD" in tx_upper or "OPENING BALANCE" in tx_upper:
                     running_balance = amounts[-1]
-                    monthly_data_store[month_label]["Start Balance"] = running_balance
+                    if monthly_data_store[month_label]["Start Balance"] == 0.0:
+                        monthly_data_store[month_label]["Start Balance"] = running_balance
                     continue
 
                 primary_amount = 0.0
                 balance_amount = None
 
                 if len(amounts) >= 2:
-                    primary_amount = amounts[-2]
                     balance_amount = amounts[-1]
                 elif len(amounts) == 1:
                     primary_amount = amounts[0]
 
-                # 3. Hybrid Classification (Math Proofing + Text Fallback)
                 is_credit = False
                 is_debit = False
 
+                # MATHEMATICAL PROOF ENGINE
                 if running_balance is not None and balance_amount is not None:
-                    diff = balance_amount - running_balance
-                    # Prove mathematically if it was a deposit or withdrawal
-                    if abs(diff - primary_amount) < 0.10:
-                        is_credit = True
-                    elif abs(diff - (-primary_amount)) < 0.10:
-                        is_debit = True
+                    diff = round(balance_amount - running_balance, 2)
+                    
+                    # Scan all extracted numbers to find the exact transaction amount
+                    for amt in amounts[:-1]:
+                        if abs(diff - amt) < 0.10:
+                            is_credit = True
+                            primary_amount = amt
+                            break
+                        elif abs(diff - (-amt)) < 0.10:
+                            is_debit = True
+                            primary_amount = amt
+                            break
 
-                # Fallback to text if math proof is unavailable (missing previous balance)
+                # Text Fallback if math fails
                 if not is_credit and not is_debit:
+                    primary_amount = amounts[-2] if len(amounts) >= 2 else amounts[0]
                     if any(kw in tx_upper for kw in ["CREDIT", "DEPOSIT", "INCOMING", "E-TRANSFER", "PAYABLE", "RTN WIRE"]):
                         is_credit = True
                     elif any(kw in tx_upper for kw in ["DEBIT", "PAYMENT", "PAD", "WITHDRAWAL", "FEE", "OUTGOING", "CHQ", "CHEQUE", "SERVICE CHARGE", "LEASE"]):
                         is_debit = True
 
-                # 4. Data Allocation
+                # DATA ALLOCATION
                 if is_credit:
                     monthly_data_store[month_label]["Stated Credits"] += primary_amount
                     if not any(excl in tx_upper for excl in REVENUE_EXCLUSIONS):
@@ -187,8 +193,8 @@ if uploaded_files:
                             mca_tracker[lender_name]["debit_count"] += 1
                             break 
                 
-                # Update running balance for next math check
-                if balance_amount is not None:
+                # Resync running balance for the next line's math proof
+                if balance_amount is not None and (is_credit or is_debit):
                     running_balance = balance_amount
                     monthly_data_store[month_label]["End Balance"] = balance_amount
 
