@@ -55,12 +55,12 @@ uploaded_files = st.file_uploader(
 
 auto_monthly_revenue = 0.0
 detected_positions = []
+detected_ach_debits = []  # <--- INITIALIZE HERE TO PREVENT NameError
 
 if uploaded_files:
     st.info(f"📁 **{len(uploaded_files)} Statements Uploaded.** Processing transactions...")
     
     total_deposits = 0.0
-    detected_ach_debits = []
     
     for pdf_file in uploaded_files:
         with pdfplumber.open(pdf_file) as pdf:
@@ -82,13 +82,11 @@ if uploaded_files:
 
                     # 2. Lender ACH Debit Detection
                     for lender_name, meta in KNOWN_FUNDERS.items():
-                        # Check if any keyword matches
                         if any(kw in line_upper for kw in meta["keywords"]):
-                            # Frequency Filter check for Vault
                             if "restrict_freq" in meta:
                                 is_monthly = "MONTHLY" in line_upper
                                 if is_monthly:
-                                    continue # Skip monthly Vault transactions
+                                    continue
                             
                             if any(term in line_upper for term in ["ACH", "DEBIT", "WITHDRAWAL", "PRE", "LNS"]):
                                 amounts = re.findall(r"\d{1,3}(?:,\d{3})*\.\d{2}", line)
@@ -105,7 +103,6 @@ if uploaded_files:
     auto_monthly_revenue = total_deposits / num_months
     
     st.success(f"✅ **Extraction Complete:** Estimated Average Monthly Revenue: **${auto_monthly_revenue:,.2f}** ({num_months} month average)")
-
 st.divider()
 
 # --- SECTION 2: UNDERWRITING INPUTS & OVERRIDES ---
