@@ -5,8 +5,8 @@ import re
 
 st.set_page_config(page_title="MCA Bank Parser & Underwriting Tool", page_icon="💳", layout="wide")
 
-st.title("💳 MCA Auto-Parser & Underwriting Engine")
-st.caption("Upload 6–10 bank statement PDFs to calculate true monthly revenue, flag NSFs, and auto-detect existing MCA positions.")
+st.title("💳 MCA Statement Analyzer & Underwriting Engine")
+st.caption("Upload 6–10 bank statement PDFs to extract monthly breakdowns, true revenue, NSF fee occurrences, and lender positions.")
 
 st.divider()
 
@@ -44,20 +44,28 @@ KNOWN_FUNDERS = {
     "FUNDFI": {"tier": "Standard", "keywords": ["FUNDFI", "FUND FI", "FUND-FI"]}
 }
 
-# --- INCLUSION & EXCLUSION RULES ---
+# --- PARSING FILTERS ---
 VALID_REVENUE_KEYWORDS = [
     "DEPOSIT", "CREDIT", "ACH IN", "SQUARE", "STRIPE", "CLOVER", 
     "E-TRANSFER", "ETRANSFER", "INTERAC", "EMAIL TRSF", "ELECTRONIC TRANSFER IN", "WIRE IN"
 ]
 
-INTERNAL_TRANSFER_EXCLUSIONS = [
+EXCLUDED_KEYWORDS = [
     "INTERNAL TRANSFER", "TRANSFER FROM", "TRSF FROM", "MEMO TRANSFER", 
-    "ACCOUNT TRANSFER", "TRANSFER BETWEEN ACCOUNTS", "TO SAVINGS", "FROM SAVINGS",
-    "REFUND", "LOAN PROCEEDS", "LINE OF CREDIT", "LOC DRAW", "CASH ADVANCE PROCEEDS"
+    "ACCOUNT TRANSFER", "TRANSFER BETWEEN", "TO SAVINGS", "FROM SAVINGS",
+    "REFUND", "LOAN PROCEEDS", "LINE OF CREDIT", "LOC DRAW", "CASH ADVANCE PROCEEDS",
+    "TOTAL DEPOSITS", "TOTAL CREDITS", "TOTAL DEBITS", "BEGINNING BALANCE", 
+    "ENDING BALANCE", "SUMMARY", "AVERAGE BALANCE", "BALANCE FORWARD"
+]
+
+# Keywords specifically matching explicit NSF / Overdraft Fee Charge Lines
+NSF_FEE_KEYWORDS = [
+    "NSF FEE", "NSF CHARGE", "NON-SUFFICIENT FEE", "OVERDRAFT FEE", 
+    "OVERDRAFT CHARGE", "RETURNED ITEM FEE", "RETURN ITEM FEE", "NSF RETURN"
 ]
 
 # --- SECTION 1: BANK STATEMENT PDF UPLOADER ---
-st.subheader("1. Bank Statement Ingestion")
+st.subheader("1. Bank Statement Ingestion & Month-by-Month Analysis")
 
 uploaded_files = st.file_uploader(
     "Upload 6-10 Monthly Bank Statements (PDF format)", 
@@ -66,17 +74,23 @@ uploaded_files = st.file_uploader(
 )
 
 auto_monthly_revenue = 0.0
-nsf_count = 0
-detected_ach_debits = []
+avg_gross_deposits = 0.0
+total_nsf_count = 0
+avg_nsf_per_month = 0.0
+detected_funder_positions = []
 
 if uploaded_files:
     num_statements = len(uploaded_files)
-    st.info(f"📁 **{num_statements} Statement(s) Uploaded.** Parsing deposits, NSFs, and positions...")
     
-    total_deposits = 0.0
-    detected_funders_map = {}
-    
+    monthly_breakdown = []
+    funder_totals = {}
+
     for pdf_file in uploaded_files:
+        stmt_gross_deposits = 0.0
+        stmt_withdrawals = 0.0
+        stmt_true_revenue = 0.0
+        stmt_nsf_fees = 0
+        
         with pdfplumber.open(pdf_file) as pdf:
             for page in pdf.pages:
                 text = page.extract_text()
@@ -87,44 +101,88 @@ if uploaded_files:
                 for line in lines:
                     line_upper = line.upper()
                     
-                    # 1. NSF / Overdraft Detection
-                    if any(nsf_kw in line_upper for nsf_kw in ["NSF", "NON-SUFFICIENT", "OVERDRAFT", "RETURNED ITEM", "NSF FEE"]):
-                        nsf_count += 1
+                    # 1. Explicit NSF Fee Occurrence Counting
+                    if any(nsf_kw in line_upper for nsf_kw in NSF_FEE_KEYWORDS):
+                        stmt_nsf_fees += 1
 
-                    # 2. Deposit / Revenue Detection (Includes E-Transfers, Excludes Internal Transfers)
+                    # Skip summary lines to prevent balance/revenue overestimation
+                    if any(excl in line_upper for excl in EXCLUDED_KEYWORDS):
+                        continue
+
+                    # Extract numerical dollar amounts
+                    amounts = re.findall(r"\d{1,3}(?:,\d{3})*\.\d{2}", line)
+                    if not amounts:
+                        continue
+                    
+                    amount_val = float(amounts[-1].replace(",", ""))
+
+                    # 2. Deposit vs. Withdrawal Categorization
                     if any(term in line_upper for term in VALID_REVENUE_KEYWORDS):
-                        if not any(excl in line_upper for excl in INTERNAL_TRANSFER_EXCLUSIONS):
-                            amounts = re.findall(r"\d{1,3}(?:,\d{3})*\.\d{2}", line)
-                            if amounts:
-                                total_deposits += float(amounts[-1].replace(",", ""))
+                        stmt_gross_deposits += amount_val
+                        stmt_true_revenue += amount_val
+                    elif any(w_kw in line_upper for w_kw in ["DEBIT", "WITHDRAWAL", "ACH OUT", "FEE", "PAYMENT", "PRE"]):
+                        stmt_withdrawals += amount_val
 
-                    # 3. Named Lender ACH Debit Detection
+                    # 3. Lender Position Detection & Frequency Categorization
                     for lender_name, meta in KNOWN_FUNDERS.items():
                         if any(kw in line_upper for kw in meta["keywords"]):
-                            if "restrict_freq" in meta:
-                                if "MONTHLY" in line_upper:
-                                    continue
+                            if "restrict_freq" in meta and "MONTHLY" in line_upper:
+                                continue
                             
-                            if any(term in line_upper for term in ["ACH", "DEBIT", "WITHDRAWAL", "PRE", "LNS"]):
-                                amounts = re.findall(r"\d{1,3}(?:,\d{3})*\.\d{2}", line)
-                                if amounts:
-                                    debit_amt = float(amounts[-1].replace(",", ""))
-                                    if lender_name not in detected_funders_map or debit_amt > detected_funders_map[lender_name]["amount"]:
-                                        detected_funders_map[lender_name] = {
-                                            "name": lender_name,
-                                            "amount": debit_amt,
-                                            "tier": meta["tier"]
-                                        }
+                            freq = "Weekly" if "WEEKLY" in line_upper else "Daily"
+                            
+                            if lender_name not in funder_totals:
+                                funder_totals[lender_name] = {"total_paid": 0.0, "freq": freq, "occurrences": 0}
+                            
+                            funder_totals[lender_name]["total_paid"] += amount_val
+                            funder_totals[lender_name]["occurrences"] += 1
 
-    # Strict Average Revenue Calculation
-    auto_monthly_revenue = total_deposits / num_statements if num_statements > 0 else 0.0
-    detected_ach_debits = list(detected_funders_map.values())
-    
-    # Display Ingestion Metrics
-    c_rev, c_nsf, c_pos = st.columns(3)
-    c_rev.metric("Parsed Average Monthly Revenue", f"${auto_monthly_revenue:,.2f}", f"{num_statements} Month Avg")
-    c_nsf.metric("NSF / Overdraft Charges", f"{nsf_count} Flagged", delta_color="inverse" if nsf_count > 0 else "normal")
-    c_pos.metric("Identified MCA Lenders", f"{len(detected_ach_debits)} Unique Funder(s)")
+        total_nsf_count += stmt_nsf_fees
+
+        monthly_breakdown.append({
+            "Statement / File": pdf_file.name,
+            "Gross Deposits ($)": stmt_gross_deposits,
+            "Withdrawals ($)": stmt_withdrawals,
+            "True Revenue ($)": stmt_true_revenue,
+            "NSF Fees Count": stmt_nsf_fees
+        })
+
+    # Summary Metrics Math
+    df_breakdown = pd.DataFrame(monthly_breakdown)
+    avg_gross_deposits = df_breakdown["Gross Deposits ($)"].mean() if not df_breakdown.empty else 0.0
+    auto_monthly_revenue = df_breakdown["True Revenue ($)"].mean() if not df_breakdown.empty else 0.0
+    avg_nsf_per_month = total_nsf_count / num_statements if num_statements > 0 else 0.0
+
+    # Calculate average monthly position impact per lender
+    for lender, data in funder_totals.items():
+        avg_monthly_impact = data["total_paid"] / num_statements
+        payment_amount = avg_monthly_impact / 21.67 if data["freq"] == "Daily" else avg_monthly_impact / 4.33
+        
+        detected_funder_positions.append({
+            "name": lender,
+            "amount": round(payment_amount, 2),
+            "freq": data["freq"],
+            "monthly_avg": round(avg_monthly_impact, 2)
+        })
+
+    # Display Month-by-Month Statement Breakdown Table (Including NSF Fee Column)
+    st.markdown("### 📊 Statement-by-Statement Breakdown")
+    st.dataframe(
+        df_breakdown.style.format({
+            "Gross Deposits ($)": "${:,.2f}",
+            "Withdrawals ($)": "${:,.2f}",
+            "True Revenue ($)": "${:,.2f}",
+            "NSF Fees Count": "{:,.0f}"
+        }), 
+        use_container_width=True
+    )
+
+    # Display Summary Headers
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Avg Gross Deposits", f"${avg_gross_deposits:,.2f}")
+    m2.metric("Avg True Monthly Revenue", f"${auto_monthly_revenue:,.2f}")
+    m3.metric("NSF Fees (Total / Avg)", f"{total_nsf_count} Total", f"{avg_nsf_per_month:.1f} / mo", delta_color="inverse" if total_nsf_count > 0 else "normal")
+    m4.metric("Detected MCA Positions", f"{len(detected_funder_positions)} Funder(s)")
 
 st.divider()
 
@@ -132,28 +190,28 @@ st.divider()
 col_left, col_right = st.columns([1, 1], gap="large")
 
 with col_left:
-    st.subheader("2. Financials & Auto-Detected Debt Positions")
+    st.subheader("2. Financials & Position Overrides")
     
     avg_monthly_rev = st.number_input(
-        "Average Monthly Revenue ($)", 
+        "Average Monthly True Revenue ($)", 
         min_value=1000.0, 
         value=float(auto_monthly_revenue if auto_monthly_revenue > 0 else 50000.0), 
         step=1000.0
     )
 
-    st.markdown("#### Active Debt Positions")
-    st.caption("Lender names and daily/weekly payments auto-populated from parsed statements.")
+    st.markdown("#### Detected Debt Positions")
+    st.caption("Auto-calculated average daily/weekly payments per lender across uploaded statements.")
 
     if "positions" not in st.session_state:
         st.session_state.positions = [{"name": "Existing Funder #1", "amount": 150.0, "freq": "Daily"}]
 
-    if detected_ach_debits and (len(st.session_state.positions) == 1 and st.session_state.positions[0]["name"] == "Existing Funder #1"):
+    if detected_funder_positions and (len(st.session_state.positions) == 1 and st.session_state.positions[0]["name"] == "Existing Funder #1"):
         st.session_state.positions = []
-        for funder in detected_ach_debits:
+        for funder in detected_funder_positions:
             st.session_state.positions.append({
                 "name": funder["name"],
                 "amount": funder["amount"],
-                "freq": "Daily"
+                "freq": funder["freq"]
             })
 
     total_existing_monthly_debt = 0.0
@@ -171,7 +229,7 @@ with col_left:
             )
         with c2:
             st.session_state.positions[i]["amount"] = st.number_input(
-                f"Debit Amount ($) #{i+1}", 
+                f"Payment Amount ($) #{i+1}", 
                 min_value=0.0, 
                 value=float(pos["amount"]), 
                 step=25.0, 
@@ -196,7 +254,7 @@ with col_left:
                 st.session_state.positions.pop(i)
                 st.rerun()
 
-        st.caption(f"Monthly Impact: **${pos_monthly:,.2f}** | **{pos_dsr_pct:.1f}% DSR**")
+        st.caption(f"Monthly Impact: **${pos_monthly:,.2f}/mo** | **{pos_dsr_pct:.1f}% DSR**")
         st.write("---")
 
     if st.button("➕ Add Debt Position"):
@@ -226,15 +284,15 @@ existing_dsr = (total_existing_monthly_debt / avg_monthly_rev) if avg_monthly_re
 risk_reasons = []
 risk_multiplier = 1.0
 
-# NSF Audit
-if nsf_count > 5:
+# NSF Penalty Audit based on average per month
+if avg_nsf_per_month > 3.0:
     risk_multiplier *= 0.70
-    risk_reasons.append(f"NSF Count: {nsf_count} Flags (High Overdraft Risk — 30% penalty applied)")
-elif nsf_count > 2:
+    risk_reasons.append(f"NSF Fee Risk: High ({total_nsf_count} total, {avg_nsf_per_month:.1f}/mo — 30% penalty applied)")
+elif avg_nsf_per_month > 1.0:
     risk_multiplier *= 0.85
-    risk_reasons.append(f"NSF Count: {nsf_count} Flags (Moderate Overdraft Risk — 15% penalty applied)")
+    risk_reasons.append(f"NSF Fee Risk: Moderate ({total_nsf_count} total, {avg_nsf_per_month:.1f}/mo — 15% penalty applied)")
 else:
-    risk_reasons.append(f"NSF Count: {nsf_count} Flags (Clean Banking Record)")
+    risk_reasons.append(f"NSF Fee Risk: Clean Record ({total_nsf_count} total fees, {avg_nsf_per_month:.1f}/mo — No penalty)")
 
 # Credit Score Audit
 if credit_score < 580:
@@ -265,7 +323,7 @@ else:
 
 # Bankruptcy Audit
 if has_bk_collections:
-    risk_reasons.append("Bankruptcy / Collections: ACTIVE ON RECORD (Hard Decline Triggered)")
+    risk_reasons.append("Bankruptcy / Collections: ACTIVE ON RECORD (Hard Decline)")
 else:
     risk_reasons.append("Bankruptcy / Collections: Clean Record")
 
@@ -303,7 +361,7 @@ with col_right:
         if has_bk_collections:
             st.write("**Reasoning:** Active Bankruptcy or Open Major Collections present.")
         elif existing_dsr >= target_dsr_cap:
-            st.write(f"**Reasoning:** Existing DSR ({existing_dsr*100:.1f}%) exceeds maximum allowable threshold ({target_dsr_cap*100:.0f}%).")
+            st.write(f"**Reasoning:** Existing DSR ({existing_dsr*100:.1f}%) exceeds maximum threshold ({target_dsr_cap*100:.0f}%).")
         else:
             st.write("**Reasoning:** Zero net funding capacity available after applying risk penalties.")
     else:
@@ -350,8 +408,9 @@ Total Payback: ${sel_repayment:,.2f}
 Payment Schedule: ${sel_daily:,.2f}/day OR ${sel_weekly:,.2f}/week
 
 Financial Metrics:
-- Parsed Average Monthly Revenue: ${avg_monthly_rev:,.2f}
-- NSF / Overdraft Flags: {nsf_count}
+- Avg Gross Deposits: ${avg_gross_deposits:,.2f}
+- Avg True Monthly Revenue: ${avg_monthly_rev:,.2f}
+- NSF Fee Occurrences: {total_nsf_count} Total ({avg_nsf_per_month:.1f}/mo avg)
 - Active Debt Positions ({num_positions}):
 {positions_summary_str}- Total Existing Monthly Debt: ${total_existing_monthly_debt:,.2f}
 - Pre-Funding DSR: {existing_dsr*100:.1f}% (Max Cap: {target_dsr_cap*100:.0f}%)
