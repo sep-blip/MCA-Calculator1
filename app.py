@@ -6,7 +6,7 @@ import re
 st.set_page_config(page_title="MCA Bank Parser & Underwriting Tool", page_icon="💳", layout="wide")
 
 st.title("💳 MCA Auto-Parser & Underwriting Engine")
-st.caption("Upload 6–10 bank statement PDFs to calculate true monthly revenue and identify existing MCA positions.")
+st.caption("Upload 6–10 bank statement PDFs to calculate true monthly revenue, flag NSFs, and auto-detect existing MCA positions.")
 
 st.divider()
 
@@ -44,6 +44,18 @@ KNOWN_FUNDERS = {
     "FUNDFI": {"tier": "Standard", "keywords": ["FUNDFI", "FUND FI", "FUND-FI"]}
 }
 
+# --- INCLUSION & EXCLUSION RULES ---
+VALID_REVENUE_KEYWORDS = [
+    "DEPOSIT", "CREDIT", "ACH IN", "SQUARE", "STRIPE", "CLOVER", 
+    "E-TRANSFER", "ETRANSFER", "INTERAC", "EMAIL TRSF", "ELECTRONIC TRANSFER IN", "WIRE IN"
+]
+
+INTERNAL_TRANSFER_EXCLUSIONS = [
+    "INTERNAL TRANSFER", "TRANSFER FROM", "TRSF FROM", "MEMO TRANSFER", 
+    "ACCOUNT TRANSFER", "TRANSFER BETWEEN ACCOUNTS", "TO SAVINGS", "FROM SAVINGS",
+    "REFUND", "LOAN PROCEEDS", "LINE OF CREDIT", "LOC DRAW", "CASH ADVANCE PROCEEDS"
+]
+
 # --- SECTION 1: BANK STATEMENT PDF UPLOADER ---
 st.subheader("1. Bank Statement Ingestion")
 
@@ -54,13 +66,15 @@ uploaded_files = st.file_uploader(
 )
 
 auto_monthly_revenue = 0.0
-detected_positions = []
-detected_ach_debits = []  # <--- INITIALIZE HERE TO PREVENT NameError
+nsf_count = 0
+detected_ach_debits = []
 
 if uploaded_files:
-    st.info(f"📁 **{len(uploaded_files)} Statements Uploaded.** Processing transactions...")
+    num_statements = len(uploaded_files)
+    st.info(f"📁 **{num_statements} Statement(s) Uploaded.** Parsing deposits, NSFs, and positions...")
     
     total_deposits = 0.0
+    detected_funders_map = {}
     
     for pdf_file in uploaded_files:
         with pdfplumber.open(pdf_file) as pdf:
@@ -73,43 +87,52 @@ if uploaded_files:
                 for line in lines:
                     line_upper = line.upper()
                     
-                    # 1. Deposit / Revenue Detection
-                    if any(term in line_upper for term in ["DEPOSIT", "CREDIT", "ACH IN", "SQUARE", "STRIPE", "CLOVER", "E-TRANSFER"]):
-                        if not any(excl in line_upper for excl in ["TRANSFER", "REFUND", "LOAN PROCEEDS", "LINE OF CREDIT"]):
+                    # 1. NSF / Overdraft Detection
+                    if any(nsf_kw in line_upper for nsf_kw in ["NSF", "NON-SUFFICIENT", "OVERDRAFT", "RETURNED ITEM", "NSF FEE"]):
+                        nsf_count += 1
+
+                    # 2. Deposit / Revenue Detection (Includes E-Transfers, Excludes Internal Transfers)
+                    if any(term in line_upper for term in VALID_REVENUE_KEYWORDS):
+                        if not any(excl in line_upper for excl in INTERNAL_TRANSFER_EXCLUSIONS):
                             amounts = re.findall(r"\d{1,3}(?:,\d{3})*\.\d{2}", line)
                             if amounts:
                                 total_deposits += float(amounts[-1].replace(",", ""))
 
-                    # 2. Lender ACH Debit Detection
+                    # 3. Named Lender ACH Debit Detection
                     for lender_name, meta in KNOWN_FUNDERS.items():
                         if any(kw in line_upper for kw in meta["keywords"]):
                             if "restrict_freq" in meta:
-                                is_monthly = "MONTHLY" in line_upper
-                                if is_monthly:
+                                if "MONTHLY" in line_upper:
                                     continue
                             
                             if any(term in line_upper for term in ["ACH", "DEBIT", "WITHDRAWAL", "PRE", "LNS"]):
                                 amounts = re.findall(r"\d{1,3}(?:,\d{3})*\.\d{2}", line)
                                 if amounts:
                                     debit_amt = float(amounts[-1].replace(",", ""))
-                                    detected_ach_debits.append({
-                                        "Lender": lender_name,
-                                        "Tier": meta["tier"],
-                                        "Amount": debit_amt,
-                                        "RawLine": line[:60]
-                                    })
+                                    if lender_name not in detected_funders_map or debit_amt > detected_funders_map[lender_name]["amount"]:
+                                        detected_funders_map[lender_name] = {
+                                            "name": lender_name,
+                                            "amount": debit_amt,
+                                            "tier": meta["tier"]
+                                        }
 
-    num_months = max(1, len(uploaded_files))
-    auto_monthly_revenue = total_deposits / num_months
+    # Strict Average Revenue Calculation
+    auto_monthly_revenue = total_deposits / num_statements if num_statements > 0 else 0.0
+    detected_ach_debits = list(detected_funders_map.values())
     
-    st.success(f"✅ **Extraction Complete:** Estimated Average Monthly Revenue: **${auto_monthly_revenue:,.2f}** ({num_months} month average)")
+    # Display Ingestion Metrics
+    c_rev, c_nsf, c_pos = st.columns(3)
+    c_rev.metric("Parsed Average Monthly Revenue", f"${auto_monthly_revenue:,.2f}", f"{num_statements} Month Avg")
+    c_nsf.metric("NSF / Overdraft Charges", f"{nsf_count} Flagged", delta_color="inverse" if nsf_count > 0 else "normal")
+    c_pos.metric("Identified MCA Lenders", f"{len(detected_ach_debits)} Unique Funder(s)")
+
 st.divider()
 
 # --- SECTION 2: UNDERWRITING INPUTS & OVERRIDES ---
 col_left, col_right = st.columns([1, 1], gap="large")
 
 with col_left:
-    st.subheader("2. Financials & Positions")
+    st.subheader("2. Financials & Auto-Detected Debt Positions")
     
     avg_monthly_rev = st.number_input(
         "Average Monthly Revenue ($)", 
@@ -119,31 +142,42 @@ with col_left:
     )
 
     st.markdown("#### Active Debt Positions")
-    st.caption("Auto-populated from detected lender ACHs. Edit amounts or add additional positions as needed.")
+    st.caption("Lender names and daily/weekly payments auto-populated from parsed statements.")
 
     if "positions" not in st.session_state:
-        st.session_state.positions = [{"amount": 150.0, "freq": "Daily"}]
+        st.session_state.positions = [{"name": "Existing Funder #1", "amount": 150.0, "freq": "Daily"}]
 
-    # Auto-populate session state if funders were detected
-    if detected_ach_debits and len(st.session_state.positions) == 1 and st.session_state.positions[0]["amount"] == 150.0:
+    if detected_ach_debits and (len(st.session_state.positions) == 1 and st.session_state.positions[0]["name"] == "Existing Funder #1"):
         st.session_state.positions = []
-        for ach in detected_ach_debits[:5]:
-            st.session_state.positions.append({"amount": ach["Amount"], "freq": "Daily"})
+        for funder in detected_ach_debits:
+            st.session_state.positions.append({
+                "name": funder["name"],
+                "amount": funder["amount"],
+                "freq": "Daily"
+            })
 
     total_existing_monthly_debt = 0.0
     num_positions = len(st.session_state.positions)
 
     for i, pos in enumerate(st.session_state.positions):
-        c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
+        st.markdown(f"**Position #{i+1}**")
+        c1, c2, c3, c4 = st.columns([2.5, 2, 2, 1])
+        
         with c1:
+            st.session_state.positions[i]["name"] = st.text_input(
+                f"Lender Name #{i+1}", 
+                value=pos.get("name", f"Position #{i+1}"), 
+                key=f"name_{i}"
+            )
+        with c2:
             st.session_state.positions[i]["amount"] = st.number_input(
-                f"Position #{i+1} Amount ($)", 
+                f"Debit Amount ($) #{i+1}", 
                 min_value=0.0, 
                 value=float(pos["amount"]), 
                 step=25.0, 
                 key=f"amt_{i}"
             )
-        with c2:
+        with c3:
             st.session_state.positions[i]["freq"] = st.selectbox(
                 f"Frequency #{i+1}", 
                 ["Daily", "Weekly"], 
@@ -156,17 +190,17 @@ with col_left:
         pos_dsr_pct = (pos_monthly / avg_monthly_rev * 100) if avg_monthly_rev > 0 else 0.0
         total_existing_monthly_debt += pos_monthly
 
-        with c3:
-            st.metric(f"Pos #{i+1} Cost", f"${pos_monthly:,.0f}/mo", f"{pos_dsr_pct:.1f}% DSR")
-
         with c4:
             st.write("")
             if st.button("🗑️", key=f"del_{i}"):
                 st.session_state.positions.pop(i)
                 st.rerun()
 
+        st.caption(f"Monthly Impact: **${pos_monthly:,.2f}** | **{pos_dsr_pct:.1f}% DSR**")
+        st.write("---")
+
     if st.button("➕ Add Debt Position"):
-        st.session_state.positions.append({"amount": 100.0, "freq": "Daily"})
+        st.session_state.positions.append({"name": "New Funder", "amount": 100.0, "freq": "Daily"})
         st.rerun()
 
     st.subheader("3. Qualitative Risk Factors")
@@ -192,6 +226,17 @@ existing_dsr = (total_existing_monthly_debt / avg_monthly_rev) if avg_monthly_re
 risk_reasons = []
 risk_multiplier = 1.0
 
+# NSF Audit
+if nsf_count > 5:
+    risk_multiplier *= 0.70
+    risk_reasons.append(f"NSF Count: {nsf_count} Flags (High Overdraft Risk — 30% penalty applied)")
+elif nsf_count > 2:
+    risk_multiplier *= 0.85
+    risk_reasons.append(f"NSF Count: {nsf_count} Flags (Moderate Overdraft Risk — 15% penalty applied)")
+else:
+    risk_reasons.append(f"NSF Count: {nsf_count} Flags (Clean Banking Record)")
+
+# Credit Score Audit
 if credit_score < 580:
     risk_multiplier *= 0.65
     risk_reasons.append(f"Credit Score: {credit_score} (Sub-580 FICO — 35% penalty)")
@@ -201,6 +246,7 @@ elif credit_score < 650:
 else:
     risk_reasons.append(f"Credit Score: {credit_score} (Prime FICO — No penalty)")
 
+# Time in Business Audit
 if tib_months < 12:
     risk_multiplier *= 0.70
     risk_reasons.append(f"Time in Business: {tib_months}m (<1 Year — 30% penalty)")
@@ -210,13 +256,20 @@ elif tib_months < 24:
 else:
     risk_reasons.append(f"Time in Business: {tib_months}m (>2 Years — No penalty)")
 
+# Industry Audit
 if "High Risk" in industry_type:
     risk_multiplier *= 0.80
     risk_reasons.append("Industry: High Risk Sector — 20% penalty")
+else:
+    risk_reasons.append("Industry: Standard Risk Sector — No penalty")
 
+# Bankruptcy Audit
 if has_bk_collections:
-    risk_reasons.append("Bankruptcy / Collections: ACTIVE ON RECORD (Decline)")
+    risk_reasons.append("Bankruptcy / Collections: ACTIVE ON RECORD (Hard Decline Triggered)")
+else:
+    risk_reasons.append("Bankruptcy / Collections: Clean Record")
 
+# Stacking Position Penalties
 position_penalty = 1.0
 if num_positions == 2:
     position_penalty = 0.85
@@ -227,6 +280,8 @@ elif num_positions == 3:
 elif num_positions >= 4:
     position_penalty = 0.50
     risk_reasons.append(f"Active Positions: {num_positions} Positions (50% max penalty)")
+else:
+    risk_reasons.append("Active Positions: 1 Position (Clean — No penalty)")
 
 final_risk_multiplier = risk_multiplier * position_penalty
 
@@ -245,6 +300,12 @@ with col_right:
 
     if has_bk_collections or existing_dsr >= target_dsr_cap or net_available_monthly <= 0:
         st.error("❌ **DECISION: DECLINED**")
+        if has_bk_collections:
+            st.write("**Reasoning:** Active Bankruptcy or Open Major Collections present.")
+        elif existing_dsr >= target_dsr_cap:
+            st.write(f"**Reasoning:** Existing DSR ({existing_dsr*100:.1f}%) exceeds maximum allowable threshold ({target_dsr_cap*100:.0f}%).")
+        else:
+            st.write("**Reasoning:** Zero net funding capacity available after applying risk penalties.")
     else:
         st.success("✅ **DECISION: APPROVED**")
 
@@ -272,17 +333,27 @@ with col_right:
 
         sel_repayment = net_available_monthly * selected_term
         sel_funding = sel_repayment / factor_rate
+        sel_daily = net_available_monthly / 21.67
+        sel_weekly = net_available_monthly / 4.33
+
+        st.markdown("### 📋 Executive Underwriting Summary")
+
+        positions_summary_str = ""
+        for p in st.session_state.positions:
+            positions_summary_str += f"  - {p['name']}: ${p['amount']:,.2f} ({p['freq']})\n"
 
         summary_text = f"""*** UNDERWRITING DECISION & OFFER SUMMARY ***
 Status: APPROVED
 Selected Offer: ${sel_funding:,.2f} for {selected_term} Months
 Target Factor Rate: {factor_rate:.2f}
 Total Payback: ${sel_repayment:,.2f}
+Payment Schedule: ${sel_daily:,.2f}/day OR ${sel_weekly:,.2f}/week
 
 Financial Metrics:
 - Parsed Average Monthly Revenue: ${avg_monthly_rev:,.2f}
-- Active Debt Positions: {num_positions} position(s)
-- Total Existing Monthly Debt: ${total_existing_monthly_debt:,.2f}
+- NSF / Overdraft Flags: {nsf_count}
+- Active Debt Positions ({num_positions}):
+{positions_summary_str}- Total Existing Monthly Debt: ${total_existing_monthly_debt:,.2f}
 - Pre-Funding DSR: {existing_dsr*100:.1f}% (Max Cap: {target_dsr_cap*100:.0f}%)
 - Combined Risk Multiplier: {final_risk_multiplier:.2f}x
 
@@ -292,3 +363,10 @@ Qualitative Audit:
             summary_text += f"- {reason}\n"
 
         st.info(summary_text)
+
+        st.download_button(
+            label=f"📄 Download Summary ({selected_term}-Month Offer)",
+            data=summary_text,
+            file_name=f"underwriting_summary_{selected_term}m.txt",
+            mime="text/plain"
+        )
