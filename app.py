@@ -7,7 +7,7 @@ from collections import defaultdict
 
 st.set_page_config(page_title="Forward Funding MCA Pricing Tool", page_icon="💳", layout="wide")
 
-st.title("💳 MCA Universal Bank Parser & Underwriting Engine")
+st.title("💳 Forward Funding Underwriting Engine")
 st.caption("Upload bank statements (Canadian Business Bank Account Only). Qualitative factors to be adjusted by user as well as factor rates and max DSR rate.")
 st.divider()
 
