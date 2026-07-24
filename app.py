@@ -12,7 +12,6 @@ st.caption("Upload bank statements (Canadian Business Bank Account Only). Qualit
 st.divider()
 
 # --- LENDER DICTIONARY WITH ALIASES & TIERS ---
-# STRICT KNOWN FUNDERS ONLY (No conventional bank loans or consumer lenders)
 KNOWN_FUNDERS = {
     "Merchant Growth": {"tier": "Premium", "keywords": ["MERCHPAD", "MERCH PAD", "MERCHANT GROWTH"]},
     "Greenbox": {"tier": "Premium", "keywords": ["GREENBOX", "GREEN BOX", "GREENBOX CAPITAL"]},
@@ -49,7 +48,8 @@ REVENUE_EXCLUSIONS = [
     "MB-TRANSFER", "BR TO BR", "ONLINE BANKING TRANSFER", "IN-BRANCH TRANSFER", "INTERNET TRANSFER", 
     "LOAN", "BDC HASCAP", "LINE OF CREDIT", "LOC DRAW", "CASH ADVANCE", "ADVANCE PROCEEDS", 
     "REVERSAL", "REFUND", "RETURNED ITEM", "RTN WIRE", "PAYROLL", "ERROR CORRECTION", 
-    "EXPIRED INTERAC", "RECLAIM", "CREDIT MEMO", "PRIVATE WEALTH", "CARAVEL", "UNITED TRADING"
+    "EXPIRED INTERAC", "RECLAIM", "CREDIT MEMO", "PRIVATE WEALTH", "CARAVEL", "UNITED TRADING",
+    "ONLINE TRANSFER, TF", "INTERAC E-TRANSFER CANCELLED", "NSF FEE REV"
 ]
 
 # --- CACHED UNIVERSAL PDF PARSING ENGINE ---
@@ -83,6 +83,7 @@ def parse_uploaded_pdfs(files_data):
                 warnings.append(f"Skipped non-bank statement: **{file_name}** (Credit Report Detected)")
                 continue
 
+            is_bmo = "BANK OF MONTREAL" in full_pdf_upper or "BMO" in full_pdf_upper
             is_rbc = "ROYAL BANK OF CANADA" in full_pdf_upper or "RBC" in full_pdf_upper
             is_scotia = "SCOTIABANK" in full_pdf_upper or "BANK OF NOVA SCOTIA" in full_pdf_upper
             is_cibc = "CIBC" in full_pdf_upper or "CANADIAN IMPERIAL BANK" in full_pdf_upper
@@ -90,7 +91,11 @@ def parse_uploaded_pdfs(files_data):
             # Month Extraction
             month_label = "Unknown Month"
             try:
-                if is_cibc:
+                if is_bmo:
+                    period_match = re.search(r"For the period ending\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})", full_pdf_text, re.IGNORECASE)
+                    if period_match:
+                        month_label = pd.to_datetime(period_match.group(1)).strftime("%b %Y")
+                elif is_cibc:
                     period_match = re.search(r"For\s+([A-Za-z]{3}\s+\d{1,2}\s+to\s+[A-Za-z]{3}\s+\d{1,2},\s+\d{4})", full_pdf_text)
                     if period_match:
                         end_date_str = period_match.group(1).split("to")[-1].strip()
@@ -116,7 +121,18 @@ def parse_uploaded_pdfs(files_data):
             # --------------------------------------------------
             # 1. SUMMARY BOX PARSER FOR STATED TOTALS
             # --------------------------------------------------
-            if is_cibc:
+            if is_bmo:
+                bmo_summary = re.search(
+                    r"(?:Business Account|Primary Chequing Account).*?\n\s*#?\d+[\d\s-]*\s+([-\d,]+\.\d{2})\s+([-\d,]+\.\d{2})\s+([-\d,]+\.\d{2})\s+([-\d,]+\.\d{2})", 
+                    full_pdf_text
+                )
+                if bmo_summary:
+                    start_bal = float(bmo_summary.group(1).replace(",", ""))
+                    stated_debits = float(bmo_summary.group(2).replace(",", ""))
+                    stated_credits = float(bmo_summary.group(3).replace(",", ""))
+                    end_bal = float(bmo_summary.group(4).replace(",", ""))
+
+            elif is_cibc:
                 open_m = re.search(r"Opening\s+balance\s+on\s+[A-Za-z]{3}\s+\d{1,2},\s+\d{4}[^\d]*?([\d,]+\.\d{2})", full_pdf_text, re.IGNORECASE)
                 deb_m = re.search(r"Withdrawals[^\d]*?([\d,]+\.\d{2})", full_pdf_text, re.IGNORECASE)
                 cred_m = re.search(r"Deposits[^\d]*?([\d,]+\.\d{2})", full_pdf_text, re.IGNORECASE)
@@ -158,13 +174,10 @@ def parse_uploaded_pdfs(files_data):
             file_mca_debits = 0.0
             file_nsf_count = 0
 
-            running_bal = start_bal
-            current_block = []
-
             for line in lines:
                 u = line.upper()
 
-                # Skip Header/Footer Lines
+                # Skip Headers/Footers
                 if any(ignore_term in u for ignore_term in ["BALANCE FORWARD", "OPENING BALANCE", "CLOSING BALANCE", "ACCOUNT SUMMARY", "PAGE ", "IMPORTANT:"]):
                     continue
 
@@ -180,36 +193,23 @@ def parse_uploaded_pdfs(files_data):
                         if amts and amts[0] >= 20.0: file_nsf_count += 1
                         elif not amts: file_nsf_count += 1
 
-                current_block.append(u)
+                # Non-Revenue Exclusions Extraction
+                if any(kw in u for kw in REVENUE_EXCLUSIONS):
+                    amts = re.findall(r"\d{1,3}(?:,\d{3})*\.\d{2}", u)
+                    if amts:
+                        credit_val = float(amts[-2].replace(",", "")) if len(amts) >= 3 else float(amts[0].replace(",", ""))
+                        non_revenue_credits += credit_val
 
-                # Balance Math Proof: Check if line ends with Transaction Amount & Ending Balance
-                amts = [float(a.replace(",", "")) for a in re.findall(r"\b\d[\d,]*\.\d{2}\b", line)]
-                if len(amts) >= 2:
-                    bal = amts[-1]
-                    tx_amt = amts[-2]
-
-                    block_str = " ".join(current_block)
-                    diff = round(bal - running_bal, 2)
-
-                    if abs(diff - tx_amt) < 0.05:
-                        # Verified INCOMING CREDIT / DEPOSIT
-                        if any(kw in block_str for kw in REVENUE_EXCLUSIONS):
-                            non_revenue_credits += tx_amt
-                        running_bal = bal
-                        current_block = []
-
-                    elif abs(diff - (-tx_amt)) < 0.05:
-                        # Verified OUTGOING DEBIT / WITHDRAWAL (Strict KNOWN_FUNDERS Match)
-                        for lender_name, meta in KNOWN_FUNDERS.items():
-                            if any(kw in block_str for kw in meta["keywords"]):
-                                if "25,000.00" in block_str and "JOURNEY" in block_str:
-                                    continue
-                                file_mca_debits += tx_amt
-                                mca_store[lender_name]["total_amount"] += tx_amt
-                                mca_store[lender_name]["debit_count"] += 1
-                                break
-                        running_bal = bal
-                        current_block = []
+                # MCA Debits Identification
+                for lender_name, meta in KNOWN_FUNDERS.items():
+                    if any(kw in u for kw in meta["keywords"]):
+                        amts = re.findall(r"\d{1,3}(?:,\d{3})*\.\d{2}", u)
+                        if amts:
+                            tx_amt = float(amts[0].replace(",", ""))
+                            file_mca_debits += tx_amt
+                            mca_store[lender_name]["total_amount"] += tx_amt
+                            mca_store[lender_name]["debit_count"] += 1
+                        break
 
             true_revenue = max(0.0, stated_credits - non_revenue_credits)
 
