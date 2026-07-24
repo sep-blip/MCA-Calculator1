@@ -49,8 +49,15 @@ REVENUE_EXCLUSIONS = [
     "LOAN", "BDC HASCAP", "LINE OF CREDIT", "LOC DRAW", "CASH ADVANCE", "ADVANCE PROCEEDS", 
     "REVERSAL", "REFUND", "RETURNED ITEM", "RTN WIRE", "PAYROLL", "ERROR CORRECTION", 
     "EXPIRED INTERAC", "RECLAIM", "CREDIT MEMO", "PRIVATE WEALTH", "CARAVEL", "UNITED TRADING",
-    "ONLINE TRANSFER, TF", "INTERAC E-TRANSFER CANCELLED", "NSF FEE REV"
+    "ONLINE TRANSFER, TF", "TF 3219", "E-TRANSFER CANCELLED", "NSF FEE REV", "SERVICE CHARGE ADJUSTMENT"
 ]
+
+def extract_amount(text):
+    """Extract floating numbers cleanly from financial strings."""
+    match = re.search(r"[-+]?\d{1,3}(?:,\d{3})*\.\d{2}", text)
+    if match:
+        return float(match.group(0).replace(",", ""))
+    return 0.0
 
 # --- CACHED UNIVERSAL PDF PARSING ENGINE ---
 @st.cache_data(show_spinner="📄 Extracting financial data ...")
@@ -83,34 +90,20 @@ def parse_uploaded_pdfs(files_data):
                 warnings.append(f"Skipped non-bank statement: **{file_name}** (Credit Report Detected)")
                 continue
 
-            is_bmo = "BANK OF MONTREAL" in full_pdf_upper or "BMO" in full_pdf_upper
-            is_rbc = "ROYAL BANK OF CANADA" in full_pdf_upper or "RBC" in full_pdf_upper
-            is_scotia = "SCOTIABANK" in full_pdf_upper or "BANK OF NOVA SCOTIA" in full_pdf_upper
-            is_cibc = "CIBC" in full_pdf_upper or "CANADIAN IMPERIAL BANK" in full_pdf_upper
-
-            # Month Extraction
+            # Universal Month/Year Extractor
             month_label = "Unknown Month"
             try:
-                if is_bmo:
-                    period_match = re.search(r"For the period ending\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})", full_pdf_text, re.IGNORECASE)
-                    if period_match:
-                        month_label = pd.to_datetime(period_match.group(1)).strftime("%b %Y")
-                elif is_cibc:
-                    period_match = re.search(r"For\s+([A-Za-z]{3}\s+\d{1,2}\s+to\s+[A-Za-z]{3}\s+\d{1,2},\s+\d{4})", full_pdf_text)
-                    if period_match:
-                        end_date_str = period_match.group(1).split("to")[-1].strip()
-                        month_label = pd.to_datetime(end_date_str).strftime("%b %Y")
-                elif is_rbc:
-                    period_match = re.search(r"([A-Za-z]+\s+\d{1,2},\s+\d{4})\s+to\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})", full_pdf_text)
-                    if period_match:
-                        month_label = pd.to_datetime(period_match.group(2)).strftime("%b %Y")
-                elif is_scotia:
-                    period_match = re.search(r"(\b[A-Za-z]{3}\s+\d{1,2}\s+\d{4}\b)\s+(\b[A-Za-z]{3}\s+\d{1,2}\s+\d{4}\b)", full_pdf_text)
-                    if period_match:
-                        month_label = pd.to_datetime(period_match.group(2)).strftime("%b %Y")
-                
-                if month_label == "Unknown Month":
-                    date_matches = re.findall(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+(\d{4})\b", full_pdf_text, re.IGNORECASE)
+                period_match = re.search(
+                    r"(?:ending|period|for|to)\s+([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})", 
+                    full_pdf_text, re.IGNORECASE
+                )
+                if period_match:
+                    month_label = pd.to_datetime(period_match.group(1)).strftime("%b %Y")
+                else:
+                    date_matches = re.findall(
+                        r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+(\d{4})\b", 
+                        full_pdf_text, re.IGNORECASE
+                    )
                     if date_matches:
                         month_label = f"{date_matches[0][0].capitalize()} {date_matches[0][1]}"
             except Exception:
@@ -119,55 +112,36 @@ def parse_uploaded_pdfs(files_data):
             start_bal, stated_credits, stated_debits, end_bal = 0.0, 0.0, 0.0, 0.0
 
             # --------------------------------------------------
-            # 1. SUMMARY BOX PARSER FOR STATED TOTALS
+            # 1. UNIVERSAL SUMMARY BOX PARSER
             # --------------------------------------------------
-            if is_bmo:
-                bmo_summary = re.search(
-                    r"(?:Business Account|Primary Chequing Account).*?\n\s*#?\d+[\d\s-]*\s+([-\d,]+\.\d{2})\s+([-\d,]+\.\d{2})\s+([-\d,]+\.\d{2})\s+([-\d,]+\.\d{2})", 
-                    full_pdf_text
-                )
-                if bmo_summary:
-                    start_bal = float(bmo_summary.group(1).replace(",", ""))
-                    stated_debits = float(bmo_summary.group(2).replace(",", ""))
-                    stated_credits = float(bmo_summary.group(3).replace(",", ""))
-                    end_bal = float(bmo_summary.group(4).replace(",", ""))
-
-            elif is_cibc:
-                open_m = re.search(r"Opening\s+balance\s+on\s+[A-Za-z]{3}\s+\d{1,2},\s+\d{4}[^\d]*?([\d,]+\.\d{2})", full_pdf_text, re.IGNORECASE)
-                deb_m = re.search(r"Withdrawals[^\d]*?([\d,]+\.\d{2})", full_pdf_text, re.IGNORECASE)
-                cred_m = re.search(r"Deposits[^\d]*?([\d,]+\.\d{2})", full_pdf_text, re.IGNORECASE)
-                close_m = re.search(r"Closing\s+balance\s+on\s+[A-Za-z]{3}\s+\d{1,2},\s+\d{4}[^\d]*?([\d,]+\.\d{2})", full_pdf_text, re.IGNORECASE)
+            # Clean text by removing table borders and normalizing whitespace
+            cleaned_text = re.sub(r"[|]", " ", full_pdf_text)
+            
+            # Pattern A: Standard summary row with 4 amounts (Opening, Debits, Credits, Closing)
+            summary_row_match = re.search(
+                r"(?:account|summary|chequing|business|plan)[^\n]*?\n[^\n]*?([-\d,]+\.\d{2})\s+([-\d,]+\.\d{2})\s+([-\d,]+\.\d{2})\s+([-\d,]+\.\d{2})",
+                cleaned_text, re.IGNORECASE
+            )
+            
+            if summary_row_match:
+                start_bal = float(summary_row_match.group(1).replace(",", ""))
+                stated_debits = float(summary_row_match.group(2).replace(",", ""))
+                stated_credits = float(summary_row_match.group(3).replace(",", ""))
+                end_bal = float(summary_row_match.group(4).replace(",", ""))
+            else:
+                # Pattern B: Keyword-specific fallback
+                open_m = re.search(r"(?:opening|previous|starting|balance forward)[^\d]*?([-\d,]+\.\d{2})", cleaned_text, re.IGNORECASE)
+                cred_m = re.search(r"(?:total credits|total deposits|total added|credited)[^\d]*?([-\d,]+\.\d{2})", cleaned_text, re.IGNORECASE)
+                deb_m = re.search(r"(?:total debits|total withdrawals|total deducted|debited)[^\d]*?([-\d,]+\.\d{2})", cleaned_text, re.IGNORECASE)
+                close_m = re.search(r"(?:closing|ending|new balance|balance on)[^\d]*?([-\d,]+\.\d{2})", cleaned_text, re.IGNORECASE)
 
                 if open_m: start_bal = float(open_m.group(1).replace(",", ""))
                 if cred_m: stated_credits = float(cred_m.group(1).replace(",", ""))
                 if deb_m: stated_debits = float(deb_m.group(1).replace(",", ""))
                 if close_m: end_bal = float(close_m.group(1).replace(",", ""))
 
-            elif is_rbc:
-                open_m = re.search(r"Opening\s+balance[^\d]*?([\d,]+\.\d{2})", full_pdf_text, re.IGNORECASE)
-                cred_m = re.search(r"Total\s+deposits\s*&\s*credits\s*\(\d+\)[^\d]*?([\d,]+\.\d{2})", full_pdf_text, re.IGNORECASE)
-                deb_m = re.search(r"Total\s+cheques\s*&\s*debits\s*\(\d+\)[^\d]*?([\d,]+\.\d{2})", full_pdf_text, re.IGNORECASE)
-                close_m = re.search(r"Closing\s+balance[^\d]*?([\d,]+\.\d{2})", full_pdf_text, re.IGNORECASE)
-
-                if open_m: start_bal = float(open_m.group(1).replace(",", ""))
-                if cred_m: stated_credits = float(cred_m.group(1).replace(",", ""))
-                if deb_m: stated_debits = float(deb_m.group(1).replace(",", ""))
-                if close_m: end_bal = float(close_m.group(1).replace(",", ""))
-
-            elif is_scotia:
-                sum_m = re.search(r"Account\s+Summary\s+for\s+this\s+Period:[\s\S]*?(\d+)\s+\$?([\d,]+\.\d{2})\s+(\d+)\s+\$?([\d,]+\.\d{2})", full_pdf_text, re.IGNORECASE)
-                if sum_m:
-                    stated_debits = float(sum_m.group(2).replace(",", ""))
-                    stated_credits = float(sum_m.group(4).replace(",", ""))
-                
-                bal_match = re.search(r"BALANCE\s+FORWARD\s+([\d,]+\.\d{2})", full_pdf_upper)
-                if bal_match: start_bal = float(bal_match.group(1).replace(",", ""))
-                
-                all_amounts = re.findall(r"\b\d[\d,]*\.\d{2}\b", full_pdf_text)
-                if all_amounts: end_bal = float(all_amounts[-1].replace(",", ""))
-
             # --------------------------------------------------
-            # 2. MULTI-LINE TRANSACTION BLOCK ANALYSIS
+            # 2. UNIVERSAL TRANSACTION PARSER
             # --------------------------------------------------
             lines = [l.strip() for l in full_pdf_text.split("\n") if l.strip()]
             non_revenue_credits = 0.0
@@ -177,11 +151,11 @@ def parse_uploaded_pdfs(files_data):
             for line in lines:
                 u = line.upper()
 
-                # Skip Headers/Footers
-                if any(ignore_term in u for ignore_term in ["BALANCE FORWARD", "OPENING BALANCE", "CLOSING BALANCE", "ACCOUNT SUMMARY", "PAGE ", "IMPORTANT:"]):
+                # Ignore general document header/footer clutter
+                if any(term in u for term in ["BALANCE FORWARD", "OPENING BALANCE", "CLOSING BALANCE", "ACCOUNT SUMMARY", "PAGE ", "IMPORTANT:"]):
                     continue
 
-                # NSF Fee Count (>= $20.00)
+                # NSF Fee Count Identification
                 if any(kw in u for kw in ["NSF ITEM FEE", "OVERDRAWN HANDLING CHGS", "NSF FEE", "NON-SUFFICIENT", "RETURNED ITEM FEE"]):
                     multi_match = re.search(r"(\d+)\s*@\s*\$?(\d+\.\d{2})", u)
                     if multi_match:
@@ -193,14 +167,14 @@ def parse_uploaded_pdfs(files_data):
                         if amts and amts[0] >= 20.0: file_nsf_count += 1
                         elif not amts: file_nsf_count += 1
 
-                # Non-Revenue Exclusions Extraction
+                # Non-Revenue Exclusions Identification
                 if any(kw in u for kw in REVENUE_EXCLUSIONS):
                     amts = re.findall(r"\d{1,3}(?:,\d{3})*\.\d{2}", u)
                     if amts:
                         credit_val = float(amts[-2].replace(",", "")) if len(amts) >= 3 else float(amts[0].replace(",", ""))
                         non_revenue_credits += credit_val
 
-                # MCA Debits Identification
+                # Competitor MCA Debits Identification
                 for lender_name, meta in KNOWN_FUNDERS.items():
                     if any(kw in u for kw in meta["keywords"]):
                         amts = re.findall(r"\d{1,3}(?:,\d{3})*\.\d{2}", u)
@@ -213,7 +187,7 @@ def parse_uploaded_pdfs(files_data):
 
             true_revenue = max(0.0, stated_credits - non_revenue_credits)
 
-            # Store Monthly Data
+            # Store Monthly Financial Figures
             monthly_store[month_label]["Start Balance"] = start_bal
             monthly_store[month_label]["Stated Credits"] += stated_credits
             monthly_store[month_label]["Non-Revenue"] += non_revenue_credits
