@@ -8,11 +8,19 @@ from collections import defaultdict
 st.set_page_config(page_title="Forward Funding MCA Pricing Tool", page_icon="💳", layout="wide")
 
 st.title("💳 Forward Funding Underwriting Engine")
-st.caption("Upload bank statements (Canadian Business Bank Account Only). Qualitative factors to be adjusted by user as well as factor rates and max DSR rate.")
+st.caption("Upload bank statements (Canadian Business Accounts - English & French). Interactive transaction reclassification, month detection, and underwriting pricing calculations are fully integrated.")
 st.divider()
 
+# --- FRENCH & ENGLISH MONTH MAPPING ---
+MONTH_MAP = {
+    "JAN": "Jan", "JANVIER": "Jan", "FEB": "Feb", "FEV": "Feb", "FÉVRIER": "Feb", "FEVRIER": "Feb",
+    "MAR": "Mar", "MARS": "Mar", "APR": "Apr", "AVR": "Apr", "AVRIL": "Apr", "MAY": "May", "MAI": "May",
+    "JUN": "Jun", "JUIN": "Jun", "JUL": "Jul", "JUIL": "Jul", "JUILLET": "Jul", "AUG": "Aug", "AOU": "Aug", "AOÛT": "Aug",
+    "SEP": "Sep", "SEPTEMBRE": "Sep", "OCT": "Oct", "OCTOBRE": "Oct", "NOV": "Nov", "NOVEMBRE": "Nov",
+    "DEC": "Dec", "DECEMBRE": "Dec", "DÉCEMBRE": "Dec"
+}
+
 # --- LENDER DICTIONARY WITH ALIASES & TIERS ---
-# STRICT KNOWN FUNDERS ONLY (No conventional bank loans or consumer lenders)
 KNOWN_FUNDERS = {
     "Merchant Growth": {"tier": "Premium", "keywords": ["MERCHPAD", "MERCH PAD", "MERCHANT GROWTH"]},
     "Greenbox": {"tier": "Premium", "keywords": ["GREENBOX", "GREEN BOX", "GREENBOX CAPITAL"]},
@@ -50,18 +58,21 @@ REVENUE_EXCLUSIONS = [
     "LOAN", "BDC HASCAP", "LINE OF CREDIT", "LOC DRAW", "CASH ADVANCE", "ADVANCE PROCEEDS", 
     "REVERSAL", "REFUND", "RETURNED ITEM", "RTN WIRE", "PAYROLL", "ERROR CORRECTION", 
     "EXPIRED INTERAC", "RECLAIM", "CREDIT MEMO", "PRIVATE WEALTH", "CARAVEL", "UNITED TRADING",
-    "ONLINE TRANSFER, TF", "TF 3219", "E-TRANSFER CANCELLED", "NSF FEE REV", "SERVICE CHARGE ADJUSTMENT"
+    "ONLINE TRANSFER, TF", "TF 3219", "E-TRANSFER CANCELLED", "NSF FEE REV", "SERVICE CHARGE ADJUSTMENT",
+    "VIREMENT ACCÈSD", "VIREMENT ACCESD", "369408 EOP", "AVANCE FONDS"
 ]
 
-# --- CACHED UNIVERSAL PDF PARSING ENGINE ---
+def clean_french_amount(text):
+    """Normalizes French space-separated amounts like '10 000.00' into standard float numbers."""
+    return re.sub(r"(\d)\s+(\d)", r"\1\2", text)
+
+# --- CACHED UNIVERSAL PDF PARSING ENGINE WITH FRENCH SUPPORT ---
 @st.cache_data(show_spinner="📄 Extracting financial data ...")
 def parse_uploaded_pdfs(files_data):
-    monthly_store = defaultdict(lambda: {
-        "Start Balance": 0.0, "Stated Credits": 0.0, "Non-Revenue": 0.0, 
-        "True Revenue": 0.0, "Stated Debits": 0.0, "MCA Debits": 0.0, 
-        "End Balance": 0.0, "NSF Count": 0
+    all_transactions = []
+    month_summary_store = defaultdict(lambda: {
+        "Start Balance": 0.0, "End Balance": 0.0, "Daily Balances": []
     })
-    mca_store = defaultdict(lambda: {"total_amount": 0.0, "debit_count": 0})
     warnings = []
 
     for file_name, file_bytes in files_data:
@@ -69,219 +80,239 @@ def parse_uploaded_pdfs(files_data):
             pdf_stream = io.BytesIO(file_bytes)
             
             with pdfplumber.open(pdf_stream) as pdf:
-                full_pdf_text = ""
-                for page in pdf.pages:
-                    full_pdf_text += (page.extract_text() or "") + "\n"
+                full_pdf_text = "\n".join([page.extract_text() or "" for page in pdf.pages])
 
             if len(full_pdf_text.strip()) < 50:
                 warnings.append(f"**{file_name}** appears to be an image/scanned PDF without text layers. Please upload native text PDFs.")
                 continue
 
-            full_pdf_upper = full_pdf_text.upper()
+            full_pdf_text_clean = clean_french_amount(full_pdf_text)
+            full_pdf_upper = full_pdf_text_clean.upper()
 
             # Guardrail: Skip Non-Bank Documents
             if "EQUIFAX" in full_pdf_upper or "CREDIT PORTFOLIO INSIGHTS" in full_pdf_upper:
                 warnings.append(f"Skipped non-bank statement: **{file_name}** (Credit Report Detected)")
                 continue
 
-            # Robust Month/Year Extractor (Handles TD, BMO, RBC, CIBC, Scotiabank, etc.)
+            # 1. Robust Month/Year Extractor (English & French)
             month_label = "Unknown Month"
             try:
-                # TD-style period check
-                period_match_td = re.search(r"Statement From - To\s*\n?\s*([A-Za-z]{3}\s+\d{1,2}/\d{2})\s*-\s*([A-Za-z]{3}\s+\d{1,2}/\d{2})", full_pdf_text, re.IGNORECASE)
-                if period_match_td:
-                    end_str = period_match_td.group(2).strip()  # e.g., "FEB 27/26"
-                    month_label = pd.to_datetime(end_str, format="%b %d/%y").strftime("%b %Y")
-                else:
-                    # General period check
-                    period_match = re.search(r"(?:ending|period|for|to)\s+([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})", full_pdf_text, re.IGNORECASE)
-                    if period_match:
-                        month_label = pd.to_datetime(period_match.group(1)).strftime("%b %Y")
+                # Desjardins French Period Check: "du 1er mars au 31 mars 2026"
+                desjardins_match = re.search(r"du\s+\d{1,2}(?:er)?\s+([A-Za-zÉéû]+)\s+au\s+\d{1,2}\s+([A-Za-zÉéû]+)\s+(\d{4})", full_pdf_text_clean, re.IGNORECASE)
+                if desjardins_match:
+                    raw_month = desjardins_match.group(2).upper()
+                    year = desjardins_match.group(3)
+                    std_month = MONTH_MAP.get(raw_month, "Unknown")
+                    if std_month != "Unknown":
+                        month_label = f"{std_month} {year}"
+
+                if month_label == "Unknown Month":
+                    # TD-style period check
+                    period_match_td = re.search(r"Statement From - To\s*\n?\s*([A-Za-z]{3}\s+\d{1,2}/\d{2})\s*-\s*([A-Za-z]{3}\s+\d{1,2}/\d{2})", full_pdf_text_clean, re.IGNORECASE)
+                    if period_match_td:
+                        end_str = period_match_td.group(2).strip()
+                        month_label = pd.to_datetime(end_str, format="%b %d/%y").strftime("%b %Y")
                     else:
-                        date_matches = re.findall(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+(\d{4})\b", full_pdf_text, re.IGNORECASE)
-                        if date_matches:
-                            month_label = f"{date_matches[0][0].capitalize()} {date_matches[0][1]}"
+                        period_match = re.search(r"(?:ending|period|for|to)\s+([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})", full_pdf_text_clean, re.IGNORECASE)
+                        if period_match:
+                            month_label = pd.to_datetime(period_match.group(1)).strftime("%b %Y")
+                        else:
+                            date_matches = re.findall(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+(\d{4})\b", full_pdf_text_clean, re.IGNORECASE)
+                            if date_matches:
+                                month_label = f"{date_matches[0][0].capitalize()} {date_matches[0][1]}"
             except Exception:
                 month_label = file_name[:15]
 
-            start_bal, stated_credits, stated_debits, end_bal = 0.0, 0.0, 0.0, 0.0
+            # 2. Extract Balances
+            start_bal, end_bal = 0.0, 0.0
+            start_match = re.search(r"(?:Solde reporté|BALANCE FORWARD)[^\n]*?([-\d,]+\.\d{2})(?:OD)?", full_pdf_text_clean, re.IGNORECASE)
+            if start_match:
+                start_bal = float(start_match.group(1).replace(",", ""))
 
-            # --------------------------------------------------
-            # 1. UNIVERSAL SUMMARY BOX PARSER
-            # --------------------------------------------------
-            # Pattern A: TD Summary block (Credits / Debits table)
-            td_totals_match = re.search(r"Credits\s*\|\s*(\d+)\s*\|\s*([\d,]+\.\d{2})[\s\S]*?Debits\s*\|\s*(\d+)\s*\|\s*([\d,]+\.\d{2})", full_pdf_text, re.IGNORECASE)
-            if td_totals_match:
-                stated_credits = float(td_totals_match.group(2).replace(",", ""))
-                stated_debits = float(td_totals_match.group(4).replace(",", ""))
-            else:
-                # Pattern B: Horizontal table row with 4 numbers (Opening, Debits, Credits, Closing)
-                cleaned_text = re.sub(r"[|]", " ", full_pdf_text)
-                summary_row_match = re.search(
-                    r"(?:account|summary|chequing|business|plan)[^\n]*?\n[^\n]*?([-\d,]+\.\d{2})\s+([-\d,]+\.\d{2})\s+([-\d,]+\.\d{2})\s+([-\d,]+\.\d{2})",
-                    cleaned_text, re.IGNORECASE
-                )
-                if summary_row_match:
-                    start_bal = float(summary_row_match.group(1).replace(",", ""))
-                    stated_debits = float(summary_row_match.group(2).replace(",", ""))
-                    stated_credits = float(summary_row_match.group(3).replace(",", ""))
-                    end_bal = float(summary_row_match.group(4).replace(",", ""))
-                else:
-                    # Pattern C: Keyword search fallback
-                    open_m = re.search(r"(?:opening|previous|starting|balance forward)[^\d]*?([-\d,]+\.\d{2})", cleaned_text, re.IGNORECASE)
-                    cred_m = re.search(r"(?:total credits|total deposits|total added|credited)[^\d]*?([-\d,]+\.\d{2})", cleaned_text, re.IGNORECASE)
-                    deb_m = re.search(r"(?:total debits|total withdrawals|total deducted|debited)[^\d]*?([-\d,]+\.\d{2})", cleaned_text, re.IGNORECASE)
-                    close_m = re.search(r"(?:closing|ending|new balance|balance on)[^\d]*?([-\d,]+\.\d{2})", cleaned_text, re.IGNORECASE)
+            bal_matches = re.findall(r"\b\d{1,3}(?:,\d{3})*\.\d{2}(?:OD)?\b", full_pdf_text_clean)
+            if bal_matches:
+                end_bal = float(bal_matches[-1].replace("OD", "").replace(",", ""))
 
-                    if open_m: start_bal = float(open_m.group(1).replace(",", ""))
-                    if cred_m: stated_credits = float(cred_m.group(1).replace(",", ""))
-                    if deb_m: stated_debits = float(deb_m.group(1).replace(",", ""))
-                    if close_m: end_bal = float(close_m.group(1).replace(",", ""))
+            month_summary_store[month_label]["Start Balance"] = start_bal
+            month_summary_store[month_label]["End Balance"] = end_bal
 
-            # Start balance fallback for TD & standard statements if not captured yet
-            if start_bal == 0.0:
-                start_match = re.search(r"BALANCE FORWARD[^\n]*?([-\d,]+\.\d{2})(?:OD)?", full_pdf_upper)
-                if start_match:
-                    start_bal = float(start_match.group(1).replace(",", ""))
-
-            # Ending balance fallback
-            if end_bal == 0.0:
-                bal_matches = re.findall(r"\b\d{1,3}(?:,\d{3})*\.\d{2}(?:OD)?\b", full_pdf_upper)
-                if bal_matches:
-                    raw_end = bal_matches[-1].replace("OD", "")
-                    end_bal = float(raw_end.replace(",", ""))
-
-            # --------------------------------------------------
-            # 2. TRANSACTION BLOCK ANALYSIS
-            # --------------------------------------------------
-            lines = [l.strip() for l in full_pdf_text.split("\n") if l.strip()]
-            non_revenue_credits = 0.0
-            file_mca_debits = 0.0
-            file_nsf_count = 0
+            # 3. Line-by-Line Transaction Analysis
+            lines = [l.strip() for l in full_pdf_text_clean.split("\n") if l.strip()]
 
             for line in lines:
                 u = line.upper()
 
-                # Ignore general document header/footer clutter
-                if any(term in u for term in ["BALANCE FORWARD", "OPENING BALANCE", "CLOSING BALANCE", "ACCOUNT SUMMARY", "PAGE ", "IMPORTANT:"]):
+                if any(term in u for term in ["SOLDE REPORTÉ", "BALANCE FORWARD", "OPENING BALANCE", "CLOSING BALANCE", "ACCOUNT SUMMARY", "PAGE ", "IMPORTANT:"]):
                     continue
 
-                # NSF Fee Count Identification
-                if any(kw in u for kw in ["NSF ITEM FEE", "OVERDRAWN HANDLING CHGS", "NSF FEE", "NON-SUFFICIENT", "RETURNED ITEM FEE", "NSF RETURN FEE"]):
-                    multi_match = re.search(r"(\d+)\s*@\s*\$?(\d+\.\d{2})", u)
-                    if multi_match:
-                        cnt = int(multi_match.group(1))
-                        fee_val = float(multi_match.group(2))
-                        if fee_val >= 20.0: file_nsf_count += cnt
-                    else:
-                        amts = [float(a.replace(",", "")) for a in re.findall(r"\b\d[\d,]*\.\d{2}\b", u)]
-                        if amts and amts[0] >= 20.0: file_nsf_count += 1
-                        elif not amts: file_nsf_count += 1
+                amts = re.findall(r"\d{1,3}(?:,\d{3})*\.\d{2}", line)
+                if not amts:
+                    continue
 
-                # Non-Revenue Exclusions Extraction
-                if any(kw in u for kw in REVENUE_EXCLUSIONS) or "WIRE" in u or "MERCHANT GROWTH INV" in u:
-                    amts = re.findall(r"\d{1,3}(?:,\d{3})*\.\d{2}", u)
-                    if amts and not "MERCH PAD INV" in u:
-                        credit_val = float(amts[-2].replace(",", "")) if len(amts) >= 3 else float(amts[0].replace(",", ""))
-                        non_revenue_credits += credit_val
+                tx_amt = float(amts[0].replace(",", ""))
 
-                # Competitor MCA Debits Identification
+                if len(amts) >= 2:
+                    month_summary_store[month_label]["Daily Balances"].append(float(amts[-1].replace(",", "")))
+
+                # Credit / Debit Determination
+                is_credit = False
+                if any(kw in u for kw in ["DÉPÔT", "DEPOT", "VIR. INTERAC DE", "VIREMENT INTERAC DE", "DÉPÔT DIRECT", "DEPOT DIRECT", "AVANCE FONDS", "RISTOURNE", "DEPOSIT", "CREDIT", "RECEIVED", "INCOMING"]) and not "SENT" in u:
+                    is_credit = True
+                elif any(code in u for code in ["VRW", "DI", "RIS"]): # Desjardins codes
+                    is_credit = True
+
+                tx_type = "Credit (Deposit)" if is_credit else "Debit (Withdrawal)"
+
+                # E-transfers are treated as Operational Revenue by default
+                is_etransfer = any(kw in u for kw in ["E-TRANSFER", "E-TFR", "INTERAC", "VIR. INTERAC DE", "VRW"]) and is_credit
+
+                category = "Operational Revenue" if tx_type == "Credit (Deposit)" else "Standard Operating Expense"
+
+                # MCA Debits Identification
                 for lender_name, meta in KNOWN_FUNDERS.items():
                     if any(kw in u for kw in meta["keywords"]):
-                        # Avoid tagging incoming Merchant Growth funding credits as debits
-                        if "MERCHANT GROWTH INV" in u:
+                        if "DÉPÔT DIRECT" in u or "MERCHANT GROWTH INV" in u or is_credit:
                             continue
-                        amts = re.findall(r"\d{1,3}(?:,\d{3})*\.\d{2}", u)
-                        if amts:
-                            tx_amt = float(amts[0].replace(",", ""))
-                            file_mca_debits += tx_amt
-                            mca_store[lender_name]["total_amount"] += tx_amt
-                            mca_store[lender_name]["debit_count"] += 1
+                        category = f"MCA Debt ({lender_name})"
                         break
 
-            true_revenue = max(0.0, stated_credits - non_revenue_credits)
+                # NSF Fee Identification
+                if any(kw in u for kw in ["NSF ITEM FEE", "RETURNED ITEM FEE", "NSF RETURN FEE", "OVERDRAWN HANDLING CHGS"]):
+                    category = "NSF / Overdraft Fee"
 
-            # Store Monthly Financial Figures
-            monthly_store[month_label]["Start Balance"] = start_bal
-            monthly_store[month_label]["Stated Credits"] += stated_credits
-            monthly_store[month_label]["Non-Revenue"] += non_revenue_credits
-            monthly_store[month_label]["True Revenue"] += true_revenue
-            monthly_store[month_label]["Stated Debits"] += stated_debits
-            monthly_store[month_label]["MCA Debits"] += file_mca_debits
-            monthly_store[month_label]["End Balance"] = end_bal
-            monthly_store[month_label]["NSF Count"] += file_nsf_count
+                # Non-Revenue Exclusions (Explicitly keeps e-transfers as revenue)
+                elif is_credit and not is_etransfer:
+                    if any(ex in u for ex in REVENUE_EXCLUSIONS) or "WIRE" in u:
+                        category = "Non-Revenue Exclusion"
+
+                all_transactions.append({
+                    "Month": month_label,
+                    "Description": line[:80],
+                    "Amount ($)": tx_amt,
+                    "Transaction Type": tx_type,
+                    "Category": category,
+                    "Source File": file_name
+                })
 
         except Exception as e:
             warnings.append(f"Error reading file **{file_name}**: {str(e)}")
 
-    return dict(monthly_store), dict(mca_store), warnings
+    return dict(month_summary_store), pd.DataFrame(all_transactions), warnings
 
 # --- SECTION 1: BANK STATEMENT UPLOADER ---
 st.subheader("1. Bank Statement Ingestion & Month-by-Month Analysis")
 
-uploaded_files = st.file_uploader(
-    "Upload Bank Statements (PDFs)", 
-    type=["pdf"], 
-    accept_multiple_files=True
-)
+uploaded_files = st.file_uploader("Upload Bank Statements (PDFs)", type=["pdf"], accept_multiple_files=True)
 
 auto_monthly_revenue = 0.0
 total_nsf_count = 0
 detected_funder_positions = []
 
 if uploaded_files:
-    files_payload = [(f.name, f.getvalue()) for f in uploaded_files]
-    monthly_data_store, mca_tracker, warnings = parse_uploaded_pdfs(files_payload)
+    if "df_transactions" not in st.session_state or st.sidebar.button("🔄 Re-process Uploaded Files"):
+        files_payload = [(f.name, f.getvalue()) for f in uploaded_files]
+        month_summary_store, df_tx, warnings = parse_uploaded_pdfs(files_payload)
+        st.session_state.month_summary_store = month_summary_store
+        st.session_state.df_transactions = df_tx
+        st.session_state.warnings = warnings
 
-    for w in warnings:
+    df_tx = st.session_state.df_transactions
+    month_summary_store = st.session_state.month_summary_store
+
+    for w in st.session_state.get("warnings", []):
         st.warning(f"⚠️ {w}")
 
-    if monthly_data_store:
-        num_active_months = max(1, len(monthly_data_store))
-        chart_data = []
-        total_true_revenue = 0.0
-        total_stated_credits = 0.0
-        total_stated_debits = 0.0
-        total_mca_debits = 0.0
+    if not df_tx.empty:
+        # --- SECTION 2: INTERACTIVE TRANSACTION CLASSIFIER ---
+        st.markdown("### ✏️ Interactive Transaction Classifier")
+        st.caption("Review extracted transaction line items below. Move any misclassified items between 'Operational Revenue' and 'Non-Revenue Exclusion' to dynamically update underwriting totals.")
 
-        for month, data in monthly_data_store.items():
-            true_rev = data["True Revenue"]
-            mca_debits = data["MCA Debits"]
-            
-            # MCA Debt % = Known Competitor MCA Debits / True Revenue
-            mca_debt_pct = (mca_debits / true_rev * 100) if true_rev > 0 else 0.0
+        edited_df = st.data_editor(
+            df_tx,
+            column_config={
+                "Category": st.column_config.SelectboxColumn(
+                    "Classification Category",
+                    options=[
+                        "Operational Revenue",
+                        "Non-Revenue Exclusion",
+                        "Standard Operating Expense",
+                        "MCA Debt (Merchant Growth)",
+                        "MCA Debt (Greenbox)",
+                        "MCA Debt (Vault)",
+                        "MCA Debt (Driven)",
+                        "MCA Debt (Journey / OnDeck)",
+                        "MCA Debt (iCapital)",
+                        "MCA Debt (Canacap)",
+                        "MCA Debt (2M7)",
+                        "MCA Debt (Other)",
+                        "NSF / Overdraft Fee"
+                    ],
+                    required=True
+                ),
+                "Amount ($)": st.column_config.NumberColumn("Amount ($)", format="$%.2f"),
+                "Month": st.column_config.TextColumn("Statement Month")
+            },
+            use_container_width=True,
+            hide_index=True,
+            num_rows="dynamic"
+        )
 
-            chart_data.append({
+        st.session_state.df_transactions = edited_df
+
+        # --- SECTION 3: RE-CALCULATE MONTHLY FINANCIAL BREAKDOWN ---
+        monthly_table = []
+        mca_tracker = defaultdict(lambda: {"total_amount": 0.0, "debit_count": 0})
+
+        for month in sorted(edited_df["Month"].unique()):
+            m_tx = edited_df[edited_df["Month"] == month]
+            m_info = month_summary_store.get(month, {"Start Balance": 0.0, "End Balance": 0.0, "Daily Balances": []})
+
+            stated_credits = m_tx[m_tx["Transaction Type"] == "Credit (Deposit)"]["Amount ($)"].sum()
+            stated_debits = m_tx[m_tx["Transaction Type"] == "Debit (Withdrawal)"]["Amount ($)"].sum()
+
+            non_rev_exclusions = m_tx[m_tx["Category"] == "Non-Revenue Exclusion"]["Amount ($)"].sum()
+            true_revenue = max(0.0, stated_credits - non_rev_exclusions)
+
+            mca_mask = m_tx["Category"].str.contains("MCA Debt", na=False)
+            mca_debits = m_tx[mca_mask]["Amount ($)"].sum()
+
+            # Track detected funders for Section 2 position overrides
+            for _, row in m_tx[mca_mask].iterrows():
+                funder_name = row["Category"].replace("MCA Debt (", "").replace(")", "")
+                mca_tracker[funder_name]["total_amount"] += row["Amount ($)"]
+                mca_tracker[funder_name]["debit_count"] += 1
+
+            nsf_count = len(m_tx[m_tx["Category"] == "NSF / Overdraft Fee"])
+            mca_debt_pct = (mca_debits / true_revenue * 100) if true_revenue > 0 else 0.0
+
+            monthly_table.append({
                 "Month": month,
-                "Start Balance ($)": data["Start Balance"],
-                "Stated Credits ($)": data["Stated Credits"],
-                "Non-Rev Exclusions ($)": data["Non-Revenue"],
-                "True Revenue ($)": true_rev,
-                "Stated Debits ($)": data["Stated Debits"],
+                "Start Balance ($)": m_info["Start Balance"],
+                "Stated Credits ($)": stated_credits,
+                "Non-Rev Exclusions ($)": non_rev_exclusions,
+                "True Revenue ($)": true_revenue,
+                "Stated Debits ($)": stated_debits,
                 "MCA Debits ($)": mca_debits,
                 "MCA Debt %": mca_debt_pct,
-                "NSF Fees (≥$20)": data["NSF Count"],
-                "End Balance ($)": data["End Balance"]
+                "NSF Fees (≥$20)": nsf_count,
+                "End Balance ($)": m_info["End Balance"]
             })
-            total_true_revenue += true_rev
-            total_stated_credits += data["Stated Credits"]
-            total_stated_debits += data["Stated Debits"]
-            total_mca_debits += mca_debits
-            total_nsf_count += data["NSF Count"]
 
-        df_breakdown = pd.DataFrame(chart_data)
-        auto_monthly_revenue = total_true_revenue / num_active_months
-        avg_monthly_credits = total_stated_credits / num_active_months
-        avg_monthly_debits = total_stated_debits / num_active_months
-        avg_mca_debits = total_mca_debits / num_active_months
+        df_breakdown = pd.DataFrame(monthly_table)
+        num_active_months = max(1, len(df_breakdown))
+
+        auto_monthly_revenue = df_breakdown["True Revenue ($)"].sum() / num_active_months
+        avg_monthly_credits = df_breakdown["Stated Credits ($)"].sum() / num_active_months
+        avg_monthly_debits = df_breakdown["Stated Debits ($)"].sum() / num_active_months
+        avg_mca_debits = df_breakdown["MCA Debits ($)"].sum() / num_active_months
+        total_nsf_count = df_breakdown["NSF Fees (≥$20)"].sum()
         avg_nsf_per_month = total_nsf_count / num_active_months
 
-        # Evaluate MCA Funder Frequency & Monthly Averages
+        # Populate positions for underwriting section
         for lender, data in mca_tracker.items():
             avg_debits_per_month = data["debit_count"] / num_active_months
             freq = "Daily" if avg_debits_per_month > 8 else "Weekly"
             divisor = 21.67 if freq == "Daily" else 4.33
-
             avg_monthly_impact = data["total_amount"] / num_active_months
             payment_amount = avg_monthly_impact / divisor
 
@@ -327,9 +358,9 @@ if uploaded_files:
         st.markdown("### 📌 Multi-Month Overview & Averages")
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Active Months", f"{num_active_months} Month(s)")
-        c2.metric("Avg Monthly Deposits", f"${avg_monthly_credits:,.2f}", f"${total_stated_credits:,.2f} Total")
-        c3.metric("Avg True Monthly Rev", f"${auto_monthly_revenue:,.2f}", f"${total_true_revenue:,.2f} Total")
-        c4.metric("Avg MCA Debt", f"${avg_mca_debits:,.2f} / mo", f"${total_mca_debits:,.2f} Total")
+        c2.metric("Avg Monthly Deposits", f"${avg_monthly_credits:,.2f}", f"${df_breakdown['Stated Credits ($)'].sum():,.2f} Total")
+        c3.metric("Avg True Monthly Rev", f"${auto_monthly_revenue:,.2f}", f"${df_breakdown['True Revenue ($)'].sum():,.2f} Total")
+        c4.metric("Avg MCA Debt", f"${avg_mca_debits:,.2f} / mo", f"${df_breakdown['MCA Debits ($)'].sum():,.2f} Total")
         c5.metric("NSF Fees (≥$20)", f"{total_nsf_count} Total", f"{avg_nsf_per_month:.1f} / mo", delta_color="inverse" if total_nsf_count > 0 else "normal")
 
 st.divider()
