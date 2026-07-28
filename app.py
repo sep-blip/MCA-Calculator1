@@ -5,6 +5,7 @@ import pdfplumber
 import io
 from collections import defaultdict
 from datetime import datetime
+import dateparser
 
 st.set_page_config(page_title="Forward Funding MCA Pricing Tool", page_icon="💳", layout="wide")
 
@@ -60,13 +61,15 @@ FR_EN_MONTHS = {
     "JUILLET": "JUL", "JUIL": "JUL", "AOÛT": "AUG", "AOUT": "AUG", "SEPTEMBRE": "SEP", 
     "SEPT": "SEP", "OCTOBRE": "OCT", "NOVEMBRE": "NOV", "DÉCEMBRE": "DEC", "DECEMBRE": "DEC"
 }
+
 MONTHS_ALL = sorted(list(set(list(FR_EN_MONTHS.keys()) + ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"])), key=len, reverse=True)
 MONTHS_REGEX = r"(?:" + "|".join(MONTHS_ALL) + r")"
-DATE_PATTERN = rf"\b(?:(\d{{1,2}})\s*({MONTHS_REGEX})|({MONTHS_REGEX})\s*(\d{{1,2}}))\b"
+
+# Enhanced Universal Date Pattern (Supports numeric dates like MM/DD, DD/MM, YYYY/MM/DD)
+DATE_PATTERN = rf"\b(?:(\d{{1,2}})[/.-](\d{{1,2}})(?:[/.-](\d{{2,4}}))?|(\d{{1,2}})\s*({MONTHS_REGEX})|({MONTHS_REGEX})\s*(\d{{1,2}}))\b"
 AMOUNT_PATTERN = r"(?<!\d)(?:-?\d{1,3}(?:[ \xA0,]\d{3})+|-?\d+)[.,]\d{2}(?!\d)"
 
 def parse_amount(amt_str):
-    """Safely converts English/French mixed formatting into a float."""
     amt_str = re.sub(r"[\s\xA0]", "", amt_str)
     is_negative = '-' in amt_str
     amt_str = amt_str.replace('-', '')
@@ -81,16 +84,17 @@ def parse_amount(amt_str):
     val = float(amt_str)
     return -val if is_negative else val
 
-def extract_visual_lines(page):
-    """FIX 1: Reconstructs text based on physical visual coordinates to maintain column integrity."""
-    words = page.extract_words(x_tolerance=2, y_tolerance=3)
-    if not words: return []
+def extract_universal_lines(page):
+    """Dynamically scales vertical tolerance and falls back to standard text extraction if visual clustering fails."""
+    words = page.extract_words(x_tolerance=2, y_tolerance=4)
+    if not words: 
+        return [line for line in page.extract_text().split('\n') if line.strip()]
     
     clusters = []
     for word in words:
         placed = False
         for cluster in clusters:
-            if abs(word['top'] - cluster[0]['top']) < 4: # 4 pt vertical tolerance for row alignment
+            if abs(word['top'] - cluster[0]['top']) < 6: # Increased tolerance to 6pts
                 cluster.append(word)
                 placed = True
                 break
@@ -101,12 +105,12 @@ def extract_visual_lines(page):
     
     lines = []
     for cluster in clusters:
-        cluster.sort(key=lambda w: w['x0']) # Read Left-to-Right
+        cluster.sort(key=lambda w: w['x0']) 
         line_str = ""
         last_x1 = cluster[0]['x0']
         for w in cluster:
             gap = w['x0'] - last_x1
-            if gap > 12: # Significant gap indicates a column jump
+            if gap > 12: 
                 line_str += "  " 
             elif gap > 0:
                 line_str += " "
@@ -125,33 +129,28 @@ def parse_universal_ledger(files_data):
         try:
             pdf_stream = io.BytesIO(file_bytes)
             with pdfplumber.open(pdf_stream) as pdf:
-                # Pre-scan for year boundaries and printed end balances
                 full_raw_text = "\n".join([page.extract_text() or "" for page in pdf.pages]).upper()
                 year_matches = re.findall(r"\b(20[2-3][0-9])\b", full_raw_text)
                 doc_years = sorted(list(set([int(y) for y in year_matches])))
                 inferred_year = doc_years[-1] if doc_years else datetime.now().year
                 
-                # FIX 3: Detect if statement bridges December to January
-                has_dec = bool(re.search(r"\b(?:DEC|DÉC)", full_raw_text))
-                has_jan = bool(re.search(r"\b(?:JAN)", full_raw_text))
+                has_dec = bool(re.search(r"\b(?:DEC|DÉC|12/)", full_raw_text))
+                has_jan = bool(re.search(r"\b(?:JAN|01/)", full_raw_text))
                 
                 last_balance = None
                 
                 for page in pdf.pages:
-                    lines = extract_visual_lines(page)
+                    lines = extract_universal_lines(page)
                     for line in lines:
                         u_line = line.upper()
 
-                        # FIX 5: Unglue single-digit dates (e.g., "3NOV" -> "3 NOV")
                         u_line = re.sub(rf"(?<!\s)(\d{{1,2}})({MONTHS_REGEX})\b", r" \1 \2", u_line)
                         u_line = re.sub(rf"\b({MONTHS_REGEX})(\d{{1,2}})(?!\s)", r"\1 \2 ", u_line)
 
-                        # FIX 4: Explicitly capture stated closing balances for reconciliation
                         if any(kw in u_line for kw in ["ENDING BALANCE", "SOLDE FINAL", "CLOSING BALANCE", "NEW BALANCE"]):
                             amts = re.findall(AMOUNT_PATTERN, u_line)
                             if amts:
                                 stated_bal = parse_amount(amts[-1])
-                                # Temporarily store against the file name; will map to Month later
                                 stated_closing_balances[file_name] = stated_bal
                             continue
                             
@@ -162,24 +161,34 @@ def parse_universal_ledger(files_data):
                         if not date_match:
                             continue
                         
-                        if date_match.group(1):
-                            day, month = date_match.group(1), date_match.group(2)
-                        else:
-                            month, day = date_match.group(3), date_match.group(4)
-                            
-                        for fr, en in FR_EN_MONTHS.items():
-                            if month.startswith(fr) or month == fr:
-                                month = en
-                                break
-                        month = month[:3].capitalize()
-                        
-                        # Apply Year Boundary Logic
+                        raw_date_str = date_match.group(0)
                         tx_year = inferred_year
-                        if has_dec and has_jan and month.upper() == "DEC":
-                            tx_year = inferred_year - 1
                         
                         try:
-                            parsed_date = datetime.strptime(f"{tx_year}-{month}-{day.zfill(2)}", "%Y-%b-%d")
+                            # Handle numeric dates vs alphabetical dates
+                            if date_match.group(1): # Numeric MM/DD or DD/MM
+                                p1, p2 = int(date_match.group(1)), int(date_match.group(2))
+                                month_val = p1 if p1 <= 12 and p2 > 12 else p2 if p2 <= 12 and p1 > 12 else p1 # Guess MM/DD format
+                                day_val = p2 if month_val == p1 else p1
+                                if date_match.group(3):
+                                    tx_year = int(date_match.group(3))
+                                    if tx_year < 100: tx_year += 2000
+                                parsed_date = datetime(tx_year, month_val, day_val)
+                            else: # Alpha dates
+                                if date_match.group(4):
+                                    day, month = date_match.group(4), date_match.group(5)
+                                else:
+                                    month, day = date_match.group(6), date_match.group(7)
+                                    
+                                for fr, en in FR_EN_MONTHS.items():
+                                    if month.startswith(fr) or month == fr:
+                                        month = en
+                                        break
+                                month = month[:3].capitalize()
+                                
+                                if has_dec and has_jan and month.upper() == "DEC":
+                                    tx_year = inferred_year - 1
+                                parsed_date = datetime.strptime(f"{tx_year}-{month}-{day.zfill(2)}", "%Y-%b-%d")
                         except ValueError:
                             continue
 
@@ -189,12 +198,11 @@ def parse_universal_ledger(files_data):
                             continue
                             
                         tx_amt = parse_amount(amts[0])
-                        desc = u_line.replace(date_match.group(0), "").replace(amts[0], "").strip()[:80]
+                        desc = u_line.replace(raw_date_str, "").replace(amts[0], "").strip()[:80]
                         
                         is_credit = None
                         current_bal = None
                         
-                        # FIX 2: Delta Math determines debit vs credit perfectly based on chronological balance shifts
                         if len(amts) >= 2:
                             current_bal = parse_amount(amts[-1])
                             if last_balance is not None:
@@ -205,7 +213,6 @@ def parse_universal_ledger(files_data):
                                 elif delta == -amt_rounded:
                                     is_credit = False
                         
-                        # Keyword Fallback if Delta Math cannot trigger
                         if is_credit is None:
                             if tx_amt < 0:
                                 is_credit = False
@@ -219,7 +226,7 @@ def parse_universal_ledger(files_data):
                                 elif any(kw in desc for kw in strict_debits):
                                     is_credit = False 
                                 else:
-                                    is_credit = False # Default constraint
+                                    is_credit = False 
 
                         if current_bal is not None:
                             last_balance = current_bal
@@ -274,7 +281,6 @@ def parse_universal_ledger(files_data):
         start_bal = running_balance
         end_bal = start_bal + m_credits - m_debits
         
-        # Link Stated Closing Balances to the final month of that file
         file_source = m_df["Source File"].iloc[-1]
         stated_bal = stated_closing_balances.get(file_source, None)
 
@@ -479,7 +485,6 @@ if uploaded_files:
                 color_arr = [''] * len(s)
                 if s["Month"] in ["TOTAL", "Average"]:
                     color_arr = ['color: red; font-weight: bold;'] * len(s)
-                # Highlight Reconciliation Failures
                 if abs(s["Reconciliation Delta"]) > 2.0 and s["Month"] not in ["TOTAL", "Average"]:
                     idx = s.index.get_loc("Reconciliation Delta")
                     color_arr[idx] = 'background-color: yellow; color: black; font-weight: bold;'
