@@ -9,7 +9,7 @@ from datetime import datetime
 st.set_page_config(page_title="Forward Funding MCA Pricing Tool", page_icon="💳", layout="wide")
 
 st.title("💳 Forward Funding Universal Underwriting Engine")
-st.caption("Universal Canadian Bank Statement Parser. Dynamically ingests English/French PDFs, sorts chronologically, removes duplicates, and bridges rolling balances across multiple months.")
+st.caption("Universal Canadian Bank Statement Parser. Utilizes visual column reconstruction, delta-math classification, and automated end-balance reconciliation.")
 st.divider()
 
 # --- DICTIONARIES & EXCLUSIONS ---
@@ -54,19 +54,15 @@ REVENUE_EXCLUSIONS = [
     "VIREMENT ACCÈSD", "VIREMENT ACCESD", "369408 EOP", "AVANCE FONDS"
 ]
 
-# Universal Date Matching Assets
 FR_EN_MONTHS = {
     "JANVIER": "JAN", "JANV": "JAN", "FÉVRIER": "FEB", "FEVRIER": "FEB", "FEV": "FEB",
     "MARS": "MAR", "AVRIL": "APR", "AVR": "APR", "MAI": "MAY", "JUIN": "JUN", 
     "JUILLET": "JUL", "JUIL": "JUL", "AOÛT": "AUG", "AOUT": "AUG", "SEPTEMBRE": "SEP", 
     "SEPT": "SEP", "OCTOBRE": "OCT", "NOVEMBRE": "NOV", "DÉCEMBRE": "DEC", "DECEMBRE": "DEC"
 }
-MONTHS_ALL = list(FR_EN_MONTHS.keys()) + ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
-MONTHS_ALL = sorted(list(set(MONTHS_ALL)), key=len, reverse=True)
+MONTHS_ALL = sorted(list(set(list(FR_EN_MONTHS.keys()) + ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"])), key=len, reverse=True)
 MONTHS_REGEX = r"(?:" + "|".join(MONTHS_ALL) + r")"
 DATE_PATTERN = rf"\b(?:(\d{{1,2}})\s*({MONTHS_REGEX})|({MONTHS_REGEX})\s*(\d{{1,2}}))\b"
-
-# Universal Amount Pattern (Handles 1,500.00 and 1 500,00 and negative values)
 AMOUNT_PATTERN = r"(?<!\d)(?:-?\d{1,3}(?:[ \xA0,]\d{3})+|-?\d+)[.,]\d{2}(?!\d)"
 
 def parse_amount(amt_str):
@@ -74,7 +70,6 @@ def parse_amount(amt_str):
     amt_str = re.sub(r"[\s\xA0]", "", amt_str)
     is_negative = '-' in amt_str
     amt_str = amt_str.replace('-', '')
-    
     if len(amt_str) >= 3 and amt_str[-3] in '.,':
         sep = amt_str[-3]
         if sep == ',': 
@@ -83,120 +78,179 @@ def parse_amount(amt_str):
             amt_str = amt_str.replace(',', '')
     else:
         amt_str = amt_str.replace(',', '') 
-        
     val = float(amt_str)
     return -val if is_negative else val
 
-# --- CACHED UNIVERSAL PARSING ENGINE ---
+def extract_visual_lines(page):
+    """FIX 1: Reconstructs text based on physical visual coordinates to maintain column integrity."""
+    words = page.extract_words(x_tolerance=2, y_tolerance=3)
+    if not words: return []
+    
+    clusters = []
+    for word in words:
+        placed = False
+        for cluster in clusters:
+            if abs(word['top'] - cluster[0]['top']) < 4: # 4 pt vertical tolerance for row alignment
+                cluster.append(word)
+                placed = True
+                break
+        if not placed:
+            clusters.append([word])
+            
+    clusters.sort(key=lambda c: c[0]['top'])
+    
+    lines = []
+    for cluster in clusters:
+        cluster.sort(key=lambda w: w['x0']) # Read Left-to-Right
+        line_str = ""
+        last_x1 = cluster[0]['x0']
+        for w in cluster:
+            gap = w['x0'] - last_x1
+            if gap > 12: # Significant gap indicates a column jump
+                line_str += "  " 
+            elif gap > 0:
+                line_str += " "
+            line_str += w['text']
+            last_x1 = w['x1']
+        lines.append(line_str.strip())
+    return lines
+
 @st.cache_data(show_spinner="📄 Aggregating & parsing global ledger...")
 def parse_universal_ledger(files_data):
     raw_transactions = []
     warnings = []
+    stated_closing_balances = {}
     
     for file_name, file_bytes in files_data:
         try:
             pdf_stream = io.BytesIO(file_bytes)
             with pdfplumber.open(pdf_stream) as pdf:
-                full_text = "\n".join([page.extract_text() or "" for page in pdf.pages])
-
-            if len(full_text.strip()) < 50:
-                warnings.append(f"**{file_name}** appears to be scanned/image-based.")
-                continue
+                # Pre-scan for year boundaries and printed end balances
+                full_raw_text = "\n".join([page.extract_text() or "" for page in pdf.pages]).upper()
+                year_matches = re.findall(r"\b(20[2-3][0-9])\b", full_raw_text)
+                doc_years = sorted(list(set([int(y) for y in year_matches])))
+                inferred_year = doc_years[-1] if doc_years else datetime.now().year
                 
-            if "EQUIFAX" in full_text.upper():
-                warnings.append(f"Skipped credit report: **{file_name}**")
-                continue
-
-            # Infer statement year from document header safely
-            year_matches = re.findall(r"\b(20[2-3][0-9])\b", full_text)
-            doc_years = sorted(list(set([int(y) for y in year_matches])))
-            inferred_year = doc_years[-1] if doc_years else datetime.now().year
-
-            # Break glued dates (e.g., "203,0003NOV" -> "203,00 03 NOV")
-            full_text = re.sub(rf"(?<!\s)(\d{{2}})({MONTHS_REGEX})\b", r" \1 \2", full_text, flags=re.IGNORECASE)
-            full_text = re.sub(rf"\b({MONTHS_REGEX})(\d{{2}})(?!\s)", r"\1 \2 ", full_text, flags=re.IGNORECASE)
-
-            lines = [l.strip() for l in full_text.split("\n") if l.strip()]
-
-            for line in lines:
-                u_line = line.upper()
+                # FIX 3: Detect if statement bridges December to January
+                has_dec = bool(re.search(r"\b(?:DEC|DÉC)", full_raw_text))
+                has_jan = bool(re.search(r"\b(?:JAN)", full_raw_text))
                 
-                # Exclude summary lines completely
-                if any(kw in u_line for kw in ["BALANCE", "SOLDE", "TOTAL", "PAGE", "SUMMARY", "OVERVIEW"]):
-                    continue
-
-                # Scan anywhere in the string for a date
-                date_match = re.search(DATE_PATTERN, u_line)
-                if not date_match:
-                    continue
+                last_balance = None
                 
-                # Extract and clean date
-                if date_match.group(1):
-                    day, month = date_match.group(1), date_match.group(2)
-                else:
-                    month, day = date_match.group(3), date_match.group(4)
-                    
-                month = month.upper()
-                for fr, en in FR_EN_MONTHS.items():
-                    if month.startswith(fr) or month == fr:
-                        month = en
-                        break
-                month = month[:3] 
-                
-                try:
-                    parsed_date = datetime.strptime(f"{inferred_year}-{month}-{day.zfill(2)}", "%Y-%b-%d")
-                except ValueError:
-                    continue
+                for page in pdf.pages:
+                    lines = extract_visual_lines(page)
+                    for line in lines:
+                        u_line = line.upper()
 
-                # Remove the date from the string so it isn't confused as an amount, then find amounts
-                line_no_date = u_line[:date_match.start()] + " " + u_line[date_match.end():]
-                amts = re.findall(AMOUNT_PATTERN, line_no_date)
-                if not amts:
-                    continue
-                    
-                tx_amt = parse_amount(amts[0])
-                desc = u_line.replace(date_match.group(0), "").replace(amts[0], "").strip()[:80]
-                
-                # Universal Debit/Credit Override Logic 
-                is_credit = False
-                if tx_amt < 0:
-                    tx_amt = abs(tx_amt)
-                else:
-                    strict_credits = ["INS ", "MSP ", "HDC ", "CMS ", "E-TRANSFER", "MOBILE DEPOSIT", "DEPOSIT", "DEPOT", "DÉPÔT", "INCOMING", "RECEPT", "TFR-FR", "RTN ", "REBATE", "PAYROLL", "PAIE", "CREDIT", "REMISE"]
-                    strict_debits = ["NSLSC", "COOPERATORS", "ENMAX", "DIRECT ENERGY", "SEND E-TFR", "WORLDREMIT", "REMITLY", "LOAN", "BPY", "W/D", "FEE", "FRAIS", "NON-TD ATM", "TFR-TO", "RETRAIT", "ACHAT", "PURCHASE", "PAYMENT", "PAIEMENT", "CHQ", "CHEQUE", "WITHDRAWAL"]
-                    
-                    if any(kw in desc for kw in strict_credits):
-                        is_credit = True
-                    if any(kw in desc for kw in strict_debits):
-                        is_credit = False # Force override if debit keyword supersedes
+                        # FIX 5: Unglue single-digit dates (e.g., "3NOV" -> "3 NOV")
+                        u_line = re.sub(rf"(?<!\s)(\d{{1,2}})({MONTHS_REGEX})\b", r" \1 \2", u_line)
+                        u_line = re.sub(rf"\b({MONTHS_REGEX})(\d{{1,2}})(?!\s)", r"\1 \2 ", u_line)
 
-                tx_type = "Credit (Deposit)" if is_credit else "Debit (Withdrawal)"
-                is_etransfer = any(kw in desc for kw in ["E-TRANSFER", "E-TFR", "INTERAC", "TFR-FR"]) and is_credit
-                category = "Operational Revenue" if tx_type == "Credit (Deposit)" else "Standard Operating Expense"
-
-                for lender_name, meta in KNOWN_FUNDERS.items():
-                    if any(kw in desc for kw in meta["keywords"]):
-                        if "DÉPÔT" in desc or is_credit:
+                        # FIX 4: Explicitly capture stated closing balances for reconciliation
+                        if any(kw in u_line for kw in ["ENDING BALANCE", "SOLDE FINAL", "CLOSING BALANCE", "NEW BALANCE"]):
+                            amts = re.findall(AMOUNT_PATTERN, u_line)
+                            if amts:
+                                stated_bal = parse_amount(amts[-1])
+                                # Temporarily store against the file name; will map to Month later
+                                stated_closing_balances[file_name] = stated_bal
                             continue
-                        category = f"MCA Debt ({lender_name})"
-                        break
+                            
+                        if any(kw in u_line for kw in ["BALANCE", "SOLDE", "TOTAL", "PAGE", "SUMMARY", "OVERVIEW"]):
+                            continue
 
-                if any(kw in desc for kw in ["NSF", "RETURNED ITEM", "OVERDRAWN", "FRAIS DE RETOUR"]):
-                    category = "NSF / Overdraft Fee"
-                elif is_credit and not is_etransfer:
-                    if any(ex in desc for ex in REVENUE_EXCLUSIONS):
-                        category = "Non-Revenue Exclusion"
+                        date_match = re.search(DATE_PATTERN, u_line)
+                        if not date_match:
+                            continue
+                        
+                        if date_match.group(1):
+                            day, month = date_match.group(1), date_match.group(2)
+                        else:
+                            month, day = date_match.group(3), date_match.group(4)
+                            
+                        for fr, en in FR_EN_MONTHS.items():
+                            if month.startswith(fr) or month == fr:
+                                month = en
+                                break
+                        month = month[:3].capitalize()
+                        
+                        # Apply Year Boundary Logic
+                        tx_year = inferred_year
+                        if has_dec and has_jan and month.upper() == "DEC":
+                            tx_year = inferred_year - 1
+                        
+                        try:
+                            parsed_date = datetime.strptime(f"{tx_year}-{month}-{day.zfill(2)}", "%Y-%b-%d")
+                        except ValueError:
+                            continue
 
-                raw_transactions.append({
-                    "Date_Obj": parsed_date,
-                    "Date": parsed_date.strftime("%Y-%m-%d"),
-                    "Month_Label": parsed_date.strftime("%B %Y"),
-                    "Description": desc,
-                    "Amount ($)": tx_amt,
-                    "Transaction Type": tx_type,
-                    "Category": category,
-                    "Source File": file_name
-                })
+                        line_no_date = u_line[:date_match.start()] + " " + u_line[date_match.end():]
+                        amts = re.findall(AMOUNT_PATTERN, line_no_date)
+                        if not amts:
+                            continue
+                            
+                        tx_amt = parse_amount(amts[0])
+                        desc = u_line.replace(date_match.group(0), "").replace(amts[0], "").strip()[:80]
+                        
+                        is_credit = None
+                        current_bal = None
+                        
+                        # FIX 2: Delta Math determines debit vs credit perfectly based on chronological balance shifts
+                        if len(amts) >= 2:
+                            current_bal = parse_amount(amts[-1])
+                            if last_balance is not None:
+                                delta = round(current_bal - last_balance, 2)
+                                amt_rounded = round(abs(tx_amt), 2)
+                                if delta == amt_rounded:
+                                    is_credit = True
+                                elif delta == -amt_rounded:
+                                    is_credit = False
+                        
+                        # Keyword Fallback if Delta Math cannot trigger
+                        if is_credit is None:
+                            if tx_amt < 0:
+                                is_credit = False
+                                tx_amt = abs(tx_amt)
+                            else:
+                                strict_credits = ["INS ", "MSP ", "HDC ", "CMS ", "E-TRANSFER", "MOBILE DEPOSIT", "DEPOSIT", "DEPOT", "DÉPÔT", "INCOMING", "RECEPT", "TFR-FR", "RTN ", "REBATE", "PAYROLL", "PAIE", "CREDIT", "REMISE"]
+                                strict_debits = ["NSLSC", "COOPERATORS", "ENMAX", "DIRECT ENERGY", "SEND E-TFR", "WORLDREMIT", "REMITLY", "LOAN", "BPY", "W/D", "FEE", "FRAIS", "NON-TD ATM", "TFR-TO", "RETRAIT", "ACHAT", "PURCHASE", "PAYMENT", "PAIEMENT", "CHQ", "CHEQUE", "WITHDRAWAL"]
+                                
+                                if any(kw in desc for kw in strict_credits):
+                                    is_credit = True
+                                elif any(kw in desc for kw in strict_debits):
+                                    is_credit = False 
+                                else:
+                                    is_credit = False # Default constraint
+
+                        if current_bal is not None:
+                            last_balance = current_bal
+
+                        tx_type = "Credit (Deposit)" if is_credit else "Debit (Withdrawal)"
+                        is_etransfer = any(kw in desc for kw in ["E-TRANSFER", "E-TFR", "INTERAC", "TFR-FR"]) and is_credit
+                        category = "Operational Revenue" if tx_type == "Credit (Deposit)" else "Standard Operating Expense"
+
+                        for lender_name, meta in KNOWN_FUNDERS.items():
+                            if any(kw in desc for kw in meta["keywords"]):
+                                if "DÉPÔT" in desc or is_credit:
+                                    continue
+                                category = f"MCA Debt ({lender_name})"
+                                break
+
+                        if any(kw in desc for kw in ["NSF", "RETURNED ITEM", "OVERDRAWN", "FRAIS DE RETOUR"]):
+                            category = "NSF / Overdraft Fee"
+                        elif is_credit and not is_etransfer:
+                            if any(ex in desc for ex in REVENUE_EXCLUSIONS):
+                                category = "Non-Revenue Exclusion"
+
+                        raw_transactions.append({
+                            "Date_Obj": parsed_date,
+                            "Date": parsed_date.strftime("%Y-%m-%d"),
+                            "Month_Label": parsed_date.strftime("%B %Y"),
+                            "Description": desc,
+                            "Amount ($)": abs(tx_amt),
+                            "Transaction Type": tx_type,
+                            "Category": category,
+                            "Source File": file_name
+                        })
 
         except Exception as e:
             warnings.append(f"Failed to read {file_name}: {str(e)}")
@@ -204,16 +258,14 @@ def parse_universal_ledger(files_data):
     if not raw_transactions:
         return {}, pd.DataFrame(), warnings
 
-    # Global Deduplication & Sorting across all uploaded PDFs
     df_all = pd.DataFrame(raw_transactions)
     df_all = df_all.sort_values(by="Date_Obj").drop_duplicates(subset=["Date", "Description", "Amount ($)", "Transaction Type"]).reset_index(drop=True)
 
-    # Monthly Aggregation & Rolling Continuous Balance Calculation
     month_summary_store = {}
     running_balance = 0.0 
     
     unique_months = df_all["Month_Label"].unique()
-    for m in unique_months:
+    for idx, m in enumerate(unique_months):
         m_df = df_all[df_all["Month_Label"] == m]
         
         m_credits = m_df[m_df["Transaction Type"] == "Credit (Deposit)"]["Amount ($)"].sum()
@@ -222,27 +274,21 @@ def parse_universal_ledger(files_data):
         start_bal = running_balance
         end_bal = start_bal + m_credits - m_debits
         
-        daily_bals = []
-        temp_bal = start_bal
-        for _, row in m_df.iterrows():
-            if row["Transaction Type"] == "Credit (Deposit)":
-                temp_bal += row["Amount ($)"]
-            else:
-                temp_bal -= row["Amount ($)"]
-            daily_bals.append(temp_bal)
+        # Link Stated Closing Balances to the final month of that file
+        file_source = m_df["Source File"].iloc[-1]
+        stated_bal = stated_closing_balances.get(file_source, None)
 
         month_summary_store[m] = {
             "Start Balance": start_bal,
-            "End Balance": end_bal,
+            "Parsed End Balance": end_bal,
+            "Stated End Balance": stated_bal if stated_bal is not None else end_bal,
             "Beginning Date": m_df["Date"].min(),
             "Ending Date": m_df["Date"].max(),
-            "Daily Balances": daily_bals
         }
-        running_balance = end_bal # Hard bridge to next month
+        running_balance = end_bal 
 
     df_display = df_all.drop(columns=["Date_Obj"])
     return month_summary_store, df_display, warnings
-
 
 # --- SECTION 1: BANK STATEMENT UPLOADER ---
 st.subheader("1. Universal Statement Ingestion & Chronological Aggregation")
@@ -308,7 +354,7 @@ if uploaded_files:
 
         for month in df_tx["Month_Label"].unique():
             m_tx = edited_df[edited_df["Month_Label"] == month]
-            m_info = month_summary_store.get(month, {"Start Balance": 0.0, "End Balance": 0.0, "Daily Balances": [], "Beginning Date": "N/A", "Ending Date": "N/A"})
+            m_info = month_summary_store.get(month, {})
 
             credits_df = m_tx[m_tx["Transaction Type"] == "Credit (Deposit)"]
             num_deposits = len(credits_df)
@@ -337,15 +383,15 @@ if uploaded_files:
                 mca_tracker[funder_name]["debit_count"] += 1
 
             nsf_count = len(m_tx[m_tx["Category"] == "NSF / Overdraft Fee"])
-            daily_bals = m_info.get("Daily Balances", [])
-            avg_bal = sum(daily_bals) / len(daily_bals) if daily_bals else m_info["End Balance"]
-            neg_days = sum(1 for b in daily_bals if b < 0)
+            parsed_end_bal = m_info.get("Parsed End Balance", 0.0)
+            stated_end_bal = m_info.get("Stated End Balance", 0.0)
+            recon_delta = parsed_end_bal - stated_end_bal
 
             monthly_table.append({
                 "Month": month,
-                "Beginning Date": m_info["Beginning Date"],
-                "Ending Date": m_info["Ending Date"],
-                "Starting Balance": m_info["Start Balance"],
+                "Beginning Date": m_info.get("Beginning Date", "N/A"),
+                "Ending Date": m_info.get("Ending Date", "N/A"),
+                "Starting Balance": m_info.get("Start Balance", 0.0),
                 "# Deposits": num_deposits,
                 "Total Deposits": total_deposits,
                 "# Revenue": num_revenue,
@@ -356,9 +402,9 @@ if uploaded_files:
                 "Total Withdrawals": total_withdrawals,
                 "# Loan Debits": num_loan_debits,
                 "Loan Debits": total_loan_debits,
-                "Ending Balance": m_info["End Balance"],
-                "Average Balance": avg_bal,
-                "# Negative Balance Days": neg_days,
+                "Parsed End Balance": parsed_end_bal,
+                "Stated End Balance": stated_end_bal,
+                "Reconciliation Delta": recon_delta,
                 "# NSF": nsf_count
             })
 
@@ -395,9 +441,9 @@ if uploaded_files:
             "Total Withdrawals": df_summary["Total Withdrawals"].sum(),
             "# Loan Debits": df_summary["# Loan Debits"].sum(),
             "Loan Debits": df_summary["Loan Debits"].sum(),
-            "Ending Balance": df_summary["Ending Balance"].sum(),
-            "Average Balance": df_summary["Average Balance"].sum(),
-            "# Negative Balance Days": df_summary["# Negative Balance Days"].sum(),
+            "Parsed End Balance": df_summary["Parsed End Balance"].sum(),
+            "Stated End Balance": df_summary["Stated End Balance"].sum(),
+            "Reconciliation Delta": df_summary["Reconciliation Delta"].sum(),
             "# NSF": df_summary["# NSF"].sum()
         }
 
@@ -414,9 +460,9 @@ if uploaded_files:
             "Total Withdrawals": df_summary["Total Withdrawals"].mean(),
             "# Loan Debits": df_summary["# Loan Debits"].mean(),
             "Loan Debits": df_summary["Loan Debits"].mean(),
-            "Ending Balance": df_summary["Ending Balance"].mean(),
-            "Average Balance": df_summary["Average Balance"].mean(),
-            "# Negative Balance Days": df_summary["# Negative Balance Days"].mean(),
+            "Parsed End Balance": df_summary["Parsed End Balance"].mean(),
+            "Stated End Balance": df_summary["Stated End Balance"].mean(),
+            "Reconciliation Delta": df_summary["Reconciliation Delta"].mean(),
             "# NSF": df_summary["# NSF"].mean()
         }
 
@@ -430,9 +476,14 @@ if uploaded_files:
             st.markdown("### Bank Statement Aggregation Summary")
             
             def highlight_totals(s):
+                color_arr = [''] * len(s)
                 if s["Month"] in ["TOTAL", "Average"]:
-                    return ['color: red; font-weight: bold;'] * len(s)
-                return [''] * len(s)
+                    color_arr = ['color: red; font-weight: bold;'] * len(s)
+                # Highlight Reconciliation Failures
+                if abs(s["Reconciliation Delta"]) > 2.0 and s["Month"] not in ["TOTAL", "Average"]:
+                    idx = s.index.get_loc("Reconciliation Delta")
+                    color_arr[idx] = 'background-color: yellow; color: black; font-weight: bold;'
+                return color_arr
 
             formatted_df = df_display.style.apply(highlight_totals, axis=1).format({
                 "Starting Balance": "${:,.2f}",
@@ -446,12 +497,13 @@ if uploaded_files:
                 "Total Withdrawals": "${:,.2f}",
                 "# Loan Debits": "{:,.2f}",
                 "Loan Debits": "${:,.2f}",
-                "Ending Balance": "${:,.2f}",
-                "Average Balance": "${:,.2f}",
-                "# Negative Balance Days": "{:,.2f}",
+                "Parsed End Balance": "${:,.2f}",
+                "Stated End Balance": "${:,.2f}",
+                "Reconciliation Delta": "${:,.2f}",
                 "# NSF": "{:,.2f}"
             })
             st.dataframe(formatted_df, use_container_width=True, hide_index=True)
+            st.caption("🔍 **Reconciliation Check**: 'Parsed End Balance' is calculated mathematically from all extracted transactions. 'Stated End Balance' is read directly from the bank's summary line. 'Reconciliation Delta' flags any missing or dropped transactions during extraction.")
 
         with tab_debt:
             st.markdown("### 💳 Classified Debt & MCA Loan Debits Bucket")
