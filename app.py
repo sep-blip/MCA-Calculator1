@@ -5,7 +5,6 @@ import pdfplumber
 import io
 from collections import defaultdict
 from datetime import datetime
-import dateparser
 
 st.set_page_config(page_title="Forward Funding MCA Pricing Tool", page_icon="💳", layout="wide")
 
@@ -55,18 +54,27 @@ REVENUE_EXCLUSIONS = [
     "VIREMENT ACCÈSD", "VIREMENT ACCESD", "369408 EOP", "AVANCE FONDS"
 ]
 
+# Universal Date Matching Assets
 FR_EN_MONTHS = {
     "JANVIER": "JAN", "JANV": "JAN", "FÉVRIER": "FEB", "FEVRIER": "FEB", "FEV": "FEB",
     "MARS": "MAR", "AVRIL": "APR", "AVR": "APR", "MAI": "MAY", "JUIN": "JUN", 
     "JUILLET": "JUL", "JUIL": "JUL", "AOÛT": "AUG", "AOUT": "AUG", "SEPTEMBRE": "SEP", 
     "SEPT": "SEP", "OCTOBRE": "OCT", "NOVEMBRE": "NOV", "DÉCEMBRE": "DEC", "DECEMBRE": "DEC"
 }
+MONTHS_ALL = list(FR_EN_MONTHS.keys()) + ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+MONTHS_ALL = sorted(list(set(MONTHS_ALL)), key=len, reverse=True)
+MONTHS_REGEX = r"(?:" + "|".join(MONTHS_ALL) + r")"
+DATE_PATTERN = rf"\b(?:(\d{{1,2}})\s*({MONTHS_REGEX})|({MONTHS_REGEX})\s*(\d{{1,2}}))\b"
 
+# Universal Amount Pattern (Handles 1,500.00 and 1 500,00 and negative values)
 AMOUNT_PATTERN = r"(?<!\d)(?:-?\d{1,3}(?:[ \xA0,]\d{3})+|-?\d+)[.,]\d{2}(?!\d)"
 
 def parse_amount(amt_str):
     """Safely converts English/French mixed formatting into a float."""
     amt_str = re.sub(r"[\s\xA0]", "", amt_str)
+    is_negative = '-' in amt_str
+    amt_str = amt_str.replace('-', '')
+    
     if len(amt_str) >= 3 and amt_str[-3] in '.,':
         sep = amt_str[-3]
         if sep == ',': 
@@ -75,18 +83,9 @@ def parse_amount(amt_str):
             amt_str = amt_str.replace(',', '')
     else:
         amt_str = amt_str.replace(',', '') 
-    return float(amt_str)
-
-def clean_date_string(date_str, inferred_year):
-    """Translates French months and standardizes date strings for parsing."""
-    date_str = date_str.upper().strip()
-    for fr, en in FR_EN_MONTHS.items():
-        date_str = re.sub(rf"\b{fr}\b", en, date_str)
-    
-    parsed_date = dateparser.parse(date_str, settings={'PREFER_DAY_OF_MONTH': 'first'})
-    if parsed_date:
-        return parsed_date.replace(year=inferred_year)
-    return None
+        
+    val = float(amt_str)
+    return -val if is_negative else val
 
 # --- CACHED UNIVERSAL PARSING ENGINE ---
 @st.cache_data(show_spinner="📄 Aggregating & parsing global ledger...")
@@ -108,72 +107,84 @@ def parse_universal_ledger(files_data):
                 warnings.append(f"Skipped credit report: **{file_name}**")
                 continue
 
-            # Infer statement year from document header
-            year_matches = re.findall(r"\b(20[1-3][0-9])\b", full_text)
-            inferred_year = int(year_matches[0]) if year_matches else datetime.now().year
+            # Infer statement year from document header safely
+            year_matches = re.findall(r"\b(20[2-3][0-9])\b", full_text)
+            doc_years = sorted(list(set([int(y) for y in year_matches])))
+            inferred_year = doc_years[-1] if doc_years else datetime.now().year
 
-            # Break glued dates (e.g., "120.0031MAR" -> "120.00 31MAR")
-            months_regex = r"(?:JAN|FEB|FEV|MAR|APR|AVR|MAY|MAI|JUN|JUI|JUL|AUG|AOU|SEP|OCT|NOV|DEC)[A-Za-zÉéû]*"
-            full_text = re.sub(rf"(?<!\s)(\d{{1,2}}\s?{months_regex})", r" \1", full_text, flags=re.IGNORECASE)
-            full_text = re.sub(rf"(?<!\s)({months_regex}\s?\d{{1,2}})", r" \1", full_text, flags=re.IGNORECASE)
+            # Break glued dates (e.g., "203,0003NOV" -> "203,00 03 NOV")
+            full_text = re.sub(rf"(?<!\s)(\d{{2}})({MONTHS_REGEX})\b", r" \1 \2", full_text, flags=re.IGNORECASE)
+            full_text = re.sub(rf"\b({MONTHS_REGEX})(\d{{2}})(?!\s)", r"\1 \2 ", full_text, flags=re.IGNORECASE)
 
             lines = [l.strip() for l in full_text.split("\n") if l.strip()]
 
             for line in lines:
                 u_line = line.upper()
                 
-                # Exclude summary lines
-                if any(kw in u_line for kw in ["BALANCE", "SOLDE", "TOTAL", "PAGE", "SUMMARY"]):
+                # Exclude summary lines completely
+                if any(kw in u_line for kw in ["BALANCE", "SOLDE", "TOTAL", "PAGE", "SUMMARY", "OVERVIEW"]):
                     continue
 
-                # Universal Date Matcher (Start of line: "31 MAR", "MAR 31", "31MAR")
-                date_match = re.search(rf"^(?:(\d{{1,2}})\s*({months_regex})|({months_regex})\s*(\d{{1,2}}))\b", u_line)
+                # Scan anywhere in the string for a date
+                date_match = re.search(DATE_PATTERN, u_line)
                 if not date_match:
                     continue
                 
-                raw_date_str = date_match.group(0)
-                parsed_date = clean_date_string(raw_date_str, inferred_year)
-                if not parsed_date:
+                # Extract and clean date
+                if date_match.group(1):
+                    day, month = date_match.group(1), date_match.group(2)
+                else:
+                    month, day = date_match.group(3), date_match.group(4)
+                    
+                month = month.upper()
+                for fr, en in FR_EN_MONTHS.items():
+                    if month.startswith(fr) or month == fr:
+                        month = en
+                        break
+                month = month[:3] 
+                
+                try:
+                    parsed_date = datetime.strptime(f"{inferred_year}-{month}-{day.zfill(2)}", "%Y-%b-%d")
+                except ValueError:
                     continue
 
-                # Extract all amounts on the line
-                amts = re.findall(AMOUNT_PATTERN, line)
+                # Remove the date from the string so it isn't confused as an amount, then find amounts
+                line_no_date = u_line[:date_match.start()] + " " + u_line[date_match.end():]
+                amts = re.findall(AMOUNT_PATTERN, line_no_date)
                 if not amts:
                     continue
-
+                    
                 tx_amt = parse_amount(amts[0])
-                desc = line[date_match.end():].replace(amts[0], "").strip()[:80]
+                desc = u_line.replace(date_match.group(0), "").replace(amts[0], "").strip()[:80]
                 
-                # Universal Debit/Credit Logic
-                # If there's a negative sign, it's a debit. If no negative sign, check keywords.
+                # Universal Debit/Credit Override Logic 
+                is_credit = False
                 if tx_amt < 0:
-                    is_credit = False
                     tx_amt = abs(tx_amt)
                 else:
-                    strict_credits = ["INS", "MSP", "HDC", "CMS", "E-TRANSFER", "DEPOSIT", "DEPOT", "DÉPÔT", "INCOMING", "RECEPT", "TFR-FR", "RTN", "REBATE"]
-                    strict_debits = ["NSLSC", "COOPERATORS", "ENMAX", "DIRECT ENERGY", "SEND E-TFR", "WORLDREMIT", "REMITLY", "LOAN", "BPY", "W/D", "FEE", "FRAIS", "NON-TD ATM", "TFR-TO"]
+                    strict_credits = ["INS ", "MSP ", "HDC ", "CMS ", "E-TRANSFER", "MOBILE DEPOSIT", "DEPOSIT", "DEPOT", "DÉPÔT", "INCOMING", "RECEPT", "TFR-FR", "RTN ", "REBATE", "PAYROLL", "PAIE", "CREDIT", "REMISE"]
+                    strict_debits = ["NSLSC", "COOPERATORS", "ENMAX", "DIRECT ENERGY", "SEND E-TFR", "WORLDREMIT", "REMITLY", "LOAN", "BPY", "W/D", "FEE", "FRAIS", "NON-TD ATM", "TFR-TO", "RETRAIT", "ACHAT", "PURCHASE", "PAYMENT", "PAIEMENT", "CHQ", "CHEQUE", "WITHDRAWAL"]
                     
-                    is_credit = False
-                    if any(kw in u_line for kw in strict_credits):
+                    if any(kw in desc for kw in strict_credits):
                         is_credit = True
-                    if any(kw in u_line for kw in strict_debits):
-                        is_credit = False 
+                    if any(kw in desc for kw in strict_debits):
+                        is_credit = False # Force override if debit keyword supersedes
 
                 tx_type = "Credit (Deposit)" if is_credit else "Debit (Withdrawal)"
-                is_etransfer = any(kw in u_line for kw in ["E-TRANSFER", "E-TFR", "INTERAC", "TFR-FR"]) and is_credit
+                is_etransfer = any(kw in desc for kw in ["E-TRANSFER", "E-TFR", "INTERAC", "TFR-FR"]) and is_credit
                 category = "Operational Revenue" if tx_type == "Credit (Deposit)" else "Standard Operating Expense"
 
                 for lender_name, meta in KNOWN_FUNDERS.items():
-                    if any(kw in u_line for kw in meta["keywords"]):
-                        if "DÉPÔT" in u_line or is_credit:
+                    if any(kw in desc for kw in meta["keywords"]):
+                        if "DÉPÔT" in desc or is_credit:
                             continue
                         category = f"MCA Debt ({lender_name})"
                         break
 
-                if any(kw in u_line for kw in ["NSF", "RETURNED ITEM", "OVERDRAWN"]):
+                if any(kw in desc for kw in ["NSF", "RETURNED ITEM", "OVERDRAWN", "FRAIS DE RETOUR"]):
                     category = "NSF / Overdraft Fee"
                 elif is_credit and not is_etransfer:
-                    if any(ex in u_line for ex in REVENUE_EXCLUSIONS):
+                    if any(ex in desc for ex in REVENUE_EXCLUSIONS):
                         category = "Non-Revenue Exclusion"
 
                 raw_transactions.append({
@@ -193,13 +204,13 @@ def parse_universal_ledger(files_data):
     if not raw_transactions:
         return {}, pd.DataFrame(), warnings
 
-    # Global Deduplication & Sorting
+    # Global Deduplication & Sorting across all uploaded PDFs
     df_all = pd.DataFrame(raw_transactions)
     df_all = df_all.sort_values(by="Date_Obj").drop_duplicates(subset=["Date", "Description", "Amount ($)", "Transaction Type"]).reset_index(drop=True)
 
-    # Monthly Aggregation & Rolling Balance Calculation
+    # Monthly Aggregation & Rolling Continuous Balance Calculation
     month_summary_store = {}
-    running_balance = 0.0 # Starts at 0, builds based on net cash flow
+    running_balance = 0.0 
     
     unique_months = df_all["Month_Label"].unique()
     for m in unique_months:
@@ -227,10 +238,11 @@ def parse_universal_ledger(files_data):
             "Ending Date": m_df["Date"].max(),
             "Daily Balances": daily_bals
         }
-        running_balance = end_bal # Pass end balance to next month's start
+        running_balance = end_bal # Hard bridge to next month
 
     df_display = df_all.drop(columns=["Date_Obj"])
     return month_summary_store, df_display, warnings
+
 
 # --- SECTION 1: BANK STATEMENT UPLOADER ---
 st.subheader("1. Universal Statement Ingestion & Chronological Aggregation")
@@ -296,7 +308,7 @@ if uploaded_files:
 
         for month in df_tx["Month_Label"].unique():
             m_tx = edited_df[edited_df["Month_Label"] == month]
-            m_info = month_summary_store[month]
+            m_info = month_summary_store.get(month, {"Start Balance": 0.0, "End Balance": 0.0, "Daily Balances": [], "Beginning Date": "N/A", "Ending Date": "N/A"})
 
             credits_df = m_tx[m_tx["Transaction Type"] == "Credit (Deposit)"]
             num_deposits = len(credits_df)
