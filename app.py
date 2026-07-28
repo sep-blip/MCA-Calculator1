@@ -4,6 +4,7 @@ import re
 import pdfplumber
 import io
 from collections import defaultdict
+from datetime import datetime
 
 st.set_page_config(page_title="Forward Funding MCA Pricing Tool", page_icon="💳", layout="wide")
 
@@ -71,7 +72,7 @@ def clean_french_amount(text):
 def parse_uploaded_pdfs(files_data):
     all_transactions = []
     month_summary_store = defaultdict(lambda: {
-        "Start Balance": 0.0, "End Balance": 0.0, "Daily Balances": []
+        "Start Balance": 0.0, "End Balance": 0.0, "Daily Balances": [], "Beginning Date": "N/A", "Ending Date": "N/A"
     })
     warnings = []
 
@@ -89,37 +90,37 @@ def parse_uploaded_pdfs(files_data):
             full_pdf_text_clean = clean_french_amount(full_pdf_text)
             full_pdf_upper = full_pdf_text_clean.upper()
 
-            # Guardrail: Skip Non-Bank Documents
             if "EQUIFAX" in full_pdf_upper or "CREDIT PORTFOLIO INSIGHTS" in full_pdf_upper:
                 warnings.append(f"Skipped non-bank statement: **{file_name}** (Credit Report Detected)")
                 continue
 
-            # 1. Robust Month/Year Extractor (English & French)
+            # 1. Month/Year & Period Extractor
             month_label = "Unknown Month"
+            beg_date, end_date = "N/A", "N/A"
             try:
-                # Desjardins French Period Check: "du 1er mars au 31 mars 2026"
-                desjardins_match = re.search(r"du\s+\d{1,2}(?:er)?\s+([A-Za-zÉéû]+)\s+au\s+\d{1,2}\s+([A-Za-zÉéû]+)\s+(\d{4})", full_pdf_text_clean, re.IGNORECASE)
+                desjardins_match = re.search(r"du\s+(\d{1,2})(?:er)?\s+([A-Za-zÉéû]+)\s+au\s+(\d{1,2})\s+([A-Za-zÉéû]+)\s+(\d{4})", full_pdf_text_clean, re.IGNORECASE)
                 if desjardins_match:
-                    raw_month = desjardins_match.group(2).upper()
-                    year = desjardins_match.group(3)
+                    raw_month = desjardins_match.group(4).upper()
+                    year = desjardins_match.group(5)
                     std_month = MONTH_MAP.get(raw_month, "Unknown")
                     if std_month != "Unknown":
                         month_label = f"{std_month} {year}"
+                    beg_date = f"{year}-{desjardins_match.group(1).zfill(2)}-01"
+                    end_date = f"{year}-{desjardins_match.group(3).zfill(2)}-28"
 
                 if month_label == "Unknown Month":
-                    # TD-style period check
                     period_match_td = re.search(r"Statement From - To\s*\n?\s*([A-Za-z]{3}\s+\d{1,2}/\d{2})\s*-\s*([A-Za-z]{3}\s+\d{1,2}/\d{2})", full_pdf_text_clean, re.IGNORECASE)
                     if period_match_td:
                         end_str = period_match_td.group(2).strip()
-                        month_label = pd.to_datetime(end_str, format="%b %d/%y").strftime("%b %Y")
+                        dt_end = pd.to_datetime(end_str, format="%b %d/%y")
+                        month_label = dt_end.strftime("%b %Y")
+                        beg_date = pd.to_datetime(period_match_td.group(1).strip(), format="%b %d/%y").strftime("%Y-%m-%d")
+                        end_date = dt_end.strftime("%Y-%m-%d")
                     else:
-                        period_match = re.search(r"(?:ending|period|for|to)\s+([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})", full_pdf_text_clean, re.IGNORECASE)
-                        if period_match:
-                            month_label = pd.to_datetime(period_match.group(1)).strftime("%b %Y")
-                        else:
-                            date_matches = re.findall(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+(\d{4})\b", full_pdf_text_clean, re.IGNORECASE)
-                            if date_matches:
-                                month_label = f"{date_matches[0][0].capitalize()} {date_matches[0][1]}"
+                        date_matches = re.findall(r"\b(\d{4}-\d{2}-\d{2})\b", full_pdf_text_clean)
+                        if date_matches:
+                            beg_date, end_date = date_matches[0], date_matches[-1]
+                            month_label = pd.to_datetime(beg_date).strftime("%b %Y")
             except Exception:
                 month_label = file_name[:15]
 
@@ -135,6 +136,8 @@ def parse_uploaded_pdfs(files_data):
 
             month_summary_store[month_label]["Start Balance"] = start_bal
             month_summary_store[month_label]["End Balance"] = end_bal
+            month_summary_store[month_label]["Beginning Date"] = beg_date
+            month_summary_store[month_label]["Ending Date"] = end_date
 
             # 3. Line-by-Line Transaction Analysis
             lines = [l.strip() for l in full_pdf_text_clean.split("\n") if l.strip()]
@@ -154,21 +157,16 @@ def parse_uploaded_pdfs(files_data):
                 if len(amts) >= 2:
                     month_summary_store[month_label]["Daily Balances"].append(float(amts[-1].replace(",", "")))
 
-                # Credit / Debit Determination
                 is_credit = False
                 if any(kw in u for kw in ["DÉPÔT", "DEPOT", "VIR. INTERAC DE", "VIREMENT INTERAC DE", "DÉPÔT DIRECT", "DEPOT DIRECT", "AVANCE FONDS", "RISTOURNE", "DEPOSIT", "CREDIT", "RECEIVED", "INCOMING"]) and not "SENT" in u:
                     is_credit = True
-                elif any(code in u for code in ["VRW", "DI", "RIS"]): # Desjardins codes
+                elif any(code in u for code in ["VRW", "DI", "RIS"]):
                     is_credit = True
 
                 tx_type = "Credit (Deposit)" if is_credit else "Debit (Withdrawal)"
-
-                # E-transfers are treated as Operational Revenue by default
                 is_etransfer = any(kw in u for kw in ["E-TRANSFER", "E-TFR", "INTERAC", "VIR. INTERAC DE", "VRW"]) and is_credit
-
                 category = "Operational Revenue" if tx_type == "Credit (Deposit)" else "Standard Operating Expense"
 
-                # MCA Debits Identification
                 for lender_name, meta in KNOWN_FUNDERS.items():
                     if any(kw in u for kw in meta["keywords"]):
                         if "DÉPÔT DIRECT" in u or "MERCHANT GROWTH INV" in u or is_credit:
@@ -176,11 +174,8 @@ def parse_uploaded_pdfs(files_data):
                         category = f"MCA Debt ({lender_name})"
                         break
 
-                # NSF Fee Identification
                 if any(kw in u for kw in ["NSF ITEM FEE", "RETURNED ITEM FEE", "NSF RETURN FEE", "OVERDRAWN HANDLING CHGS"]):
                     category = "NSF / Overdraft Fee"
-
-                # Non-Revenue Exclusions (Explicitly keeps e-transfers as revenue)
                 elif is_credit and not is_etransfer:
                     if any(ex in u for ex in REVENUE_EXCLUSIONS) or "WIRE" in u:
                         category = "Non-Revenue Exclusion"
@@ -224,91 +219,106 @@ if uploaded_files:
 
     if not df_tx.empty:
         # --- SECTION 2: INTERACTIVE TRANSACTION CLASSIFIER ---
-        st.markdown("### ✏️ Interactive Transaction Classifier")
-        st.caption("Review extracted transaction line items below. Move any misclassified items between 'Operational Revenue' and 'Non-Revenue Exclusion' to dynamically update underwriting totals.")
+        with st.expander("✏️ Interactive Transaction Classifier (Click to Expand)", expanded=False):
+            st.caption("Review extracted transaction line items below. Edit classification categories to update underwriting totals dynamically.")
 
-        edited_df = st.data_editor(
-            df_tx,
-            column_config={
-                "Category": st.column_config.SelectboxColumn(
-                    "Classification Category",
-                    options=[
-                        "Operational Revenue",
-                        "Non-Revenue Exclusion",
-                        "Standard Operating Expense",
-                        "MCA Debt (Merchant Growth)",
-                        "MCA Debt (Greenbox)",
-                        "MCA Debt (Vault)",
-                        "MCA Debt (Driven)",
-                        "MCA Debt (Journey / OnDeck)",
-                        "MCA Debt (iCapital)",
-                        "MCA Debt (Canacap)",
-                        "MCA Debt (2M7)",
-                        "MCA Debt (Other)",
-                        "NSF / Overdraft Fee"
-                    ],
-                    required=True
-                ),
-                "Amount ($)": st.column_config.NumberColumn("Amount ($)", format="$%.2f"),
-                "Month": st.column_config.TextColumn("Statement Month")
-            },
-            use_container_width=True,
-            hide_index=True,
-            num_rows="dynamic"
-        )
+            edited_df = st.data_editor(
+                df_tx,
+                column_config={
+                    "Category": st.column_config.SelectboxColumn(
+                        "Classification Category",
+                        options=[
+                            "Operational Revenue",
+                            "Non-Revenue Exclusion",
+                            "Standard Operating Expense",
+                            "MCA Debt (Merchant Growth)",
+                            "MCA Debt (Greenbox)",
+                            "MCA Debt (Vault)",
+                            "MCA Debt (Driven)",
+                            "MCA Debt (Journey / OnDeck)",
+                            "MCA Debt (iCapital)",
+                            "MCA Debt (Canacap)",
+                            "MCA Debt (2M7)",
+                            "MCA Debt (Other)",
+                            "NSF / Overdraft Fee"
+                        ],
+                        required=True
+                    ),
+                    "Amount ($)": st.column_config.NumberColumn("Amount ($)", format="$%.2f"),
+                    "Month": st.column_config.TextColumn("Statement Month")
+                },
+                use_container_width=True,
+                hide_index=True,
+                num_rows="dynamic"
+            )
+            st.session_state.df_transactions = edited_df
 
-        st.session_state.df_transactions = edited_df
-
-        # --- SECTION 3: RE-CALCULATE MONTHLY FINANCIAL BREAKDOWN ---
+        # --- RE-CALCULATE MONTHLY FINANCIAL BREAKDOWN ---
         monthly_table = []
         mca_tracker = defaultdict(lambda: {"total_amount": 0.0, "debit_count": 0})
 
         for month in sorted(edited_df["Month"].unique()):
             m_tx = edited_df[edited_df["Month"] == month]
-            m_info = month_summary_store.get(month, {"Start Balance": 0.0, "End Balance": 0.0, "Daily Balances": []})
+            m_info = month_summary_store.get(month, {"Start Balance": 0.0, "End Balance": 0.0, "Daily Balances": [], "Beginning Date": "N/A", "Ending Date": "N/A"})
 
-            stated_credits = m_tx[m_tx["Transaction Type"] == "Credit (Deposit)"]["Amount ($)"].sum()
-            stated_debits = m_tx[m_tx["Transaction Type"] == "Debit (Withdrawal)"]["Amount ($)"].sum()
+            credits_df = m_tx[m_tx["Transaction Type"] == "Credit (Deposit)"]
+            num_deposits = len(credits_df)
+            total_deposits = credits_df["Amount ($)"].sum()
 
-            non_rev_exclusions = m_tx[m_tx["Category"] == "Non-Revenue Exclusion"]["Amount ($)"].sum()
-            true_revenue = max(0.0, stated_credits - non_rev_exclusions)
+            rev_df = m_tx[m_tx["Category"] == "Operational Revenue"]
+            num_revenue = len(rev_df)
+            total_revenue = rev_df["Amount ($)"].sum()
+
+            non_rev_df = m_tx[m_tx["Category"] == "Non-Revenue Exclusion"]
+            num_non_rev = len(non_rev_df)
+            total_non_rev = non_rev_df["Amount ($)"].sum()
+
+            debits_df = m_tx[m_tx["Transaction Type"] == "Debit (Withdrawal)"]
+            num_withdrawals = len(debits_df)
+            total_withdrawals = debits_df["Amount ($)"].sum()
 
             mca_mask = m_tx["Category"].str.contains("MCA Debt", na=False)
-            mca_debits = m_tx[mca_mask]["Amount ($)"].sum()
+            mca_df = m_tx[mca_mask]
+            num_loan_debits = len(mca_df)
+            total_loan_debits = mca_df["Amount ($)"].sum()
 
-            # Track detected funders for Section 2 position overrides
-            for _, row in m_tx[mca_mask].iterrows():
+            for _, row in mca_df.iterrows():
                 funder_name = row["Category"].replace("MCA Debt (", "").replace(")", "")
                 mca_tracker[funder_name]["total_amount"] += row["Amount ($)"]
                 mca_tracker[funder_name]["debit_count"] += 1
 
             nsf_count = len(m_tx[m_tx["Category"] == "NSF / Overdraft Fee"])
-            mca_debt_pct = (mca_debits / true_revenue * 100) if true_revenue > 0 else 0.0
+            daily_bals = m_info.get("Daily Balances", [])
+            avg_bal = sum(daily_bals) / len(daily_bals) if daily_bals else m_info["End Balance"]
+            neg_days = sum(1 for b in daily_bals if b < 0)
 
             monthly_table.append({
                 "Month": month,
-                "Start Balance ($)": m_info["Start Balance"],
-                "Stated Credits ($)": stated_credits,
-                "Non-Rev Exclusions ($)": non_rev_exclusions,
-                "True Revenue ($)": true_revenue,
-                "Stated Debits ($)": stated_debits,
-                "MCA Debits ($)": mca_debits,
-                "MCA Debt %": mca_debt_pct,
-                "NSF Fees (≥$20)": nsf_count,
-                "End Balance ($)": m_info["End Balance"]
+                "Beginning Date": m_info["Beginning Date"],
+                "Ending Date": m_info["Ending Date"],
+                "Starting Balance": m_info["Start Balance"],
+                "# Deposits": num_deposits,
+                "Total Deposits": total_deposits,
+                "# Revenue": num_revenue,
+                "Total Revenue (Excluding Transfers)": total_revenue,
+                "# Non Revenue": num_non_rev,
+                "Total Non Revenue": total_non_rev,
+                "# Withdrawals": num_withdrawals,
+                "Total Withdrawals": total_withdrawals,
+                "# Loan Debits": num_loan_debits,
+                "Loan Debits": total_loan_debits,
+                "Ending Balance": m_info["End Balance"],
+                "Average Balance": avg_bal,
+                "# Negative Balance Days": neg_days,
+                "# NSF": nsf_count
             })
 
-        df_breakdown = pd.DataFrame(monthly_table)
-        num_active_months = max(1, len(df_breakdown))
+        df_summary = pd.DataFrame(monthly_table)
+        num_active_months = max(1, len(df_summary))
 
-        auto_monthly_revenue = df_breakdown["True Revenue ($)"].sum() / num_active_months
-        avg_monthly_credits = df_breakdown["Stated Credits ($)"].sum() / num_active_months
-        avg_monthly_debits = df_breakdown["Stated Debits ($)"].sum() / num_active_months
-        avg_mca_debits = df_breakdown["MCA Debits ($)"].sum() / num_active_months
-        total_nsf_count = df_breakdown["NSF Fees (≥$20)"].sum()
-        avg_nsf_per_month = total_nsf_count / num_active_months
+        auto_monthly_revenue = df_summary["Total Revenue (Excluding Transfers)"].sum() / num_active_months
+        total_nsf_count = df_summary["# NSF"].sum()
 
-        # Populate positions for underwriting section
         for lender, data in mca_tracker.items():
             avg_debits_per_month = data["debit_count"] / num_active_months
             freq = "Daily" if avg_debits_per_month > 8 else "Weekly"
@@ -323,45 +333,107 @@ if uploaded_files:
                 "monthly_avg": round(avg_monthly_impact, 2)
             })
 
-        st.markdown("### 📊 Extracted Monthly Financial Breakdown")
-        st.dataframe(
-            df_breakdown.style.format({
-                "Start Balance ($)": "${:,.2f}",
-                "Stated Credits ($)": "${:,.2f}",
-                "Non-Rev Exclusions ($)": "${:,.2f}",
-                "True Revenue ($)": "${:,.2f}",
-                "Stated Debits ($)": "${:,.2f}",
-                "MCA Debits ($)": "${:,.2f}",
-                "MCA Debt %": "{:.1f}%",
-                "End Balance ($)": "${:,.2f}",
-                "NSF Fees (≥$20)": "{:,.0f}"
-            }), 
-            use_container_width=True, hide_index=True
-        )
+        # BUILD TOTAL & AVERAGE ROWS
+        total_row = {
+            "Month": "TOTAL", "Beginning Date": "", "Ending Date": "",
+            "Starting Balance": df_summary["Starting Balance"].sum(),
+            "# Deposits": df_summary["# Deposits"].sum(),
+            "Total Deposits": df_summary["Total Deposits"].sum(),
+            "# Revenue": df_summary["# Revenue"].sum(),
+            "Total Revenue (Excluding Transfers)": df_summary["Total Revenue (Excluding Transfers)"].sum(),
+            "# Non Revenue": df_summary["# Non Revenue"].sum(),
+            "Total Non Revenue": df_summary["Total Non Revenue"].sum(),
+            "# Withdrawals": df_summary["# Withdrawals"].sum(),
+            "Total Withdrawals": df_summary["Total Withdrawals"].sum(),
+            "# Loan Debits": df_summary["# Loan Debits"].sum(),
+            "Loan Debits": df_summary["Loan Debits"].sum(),
+            "Ending Balance": df_summary["Ending Balance"].sum(),
+            "Average Balance": df_summary["Average Balance"].sum(),
+            "# Negative Balance Days": df_summary["# Negative Balance Days"].sum(),
+            "# NSF": df_summary["# NSF"].sum()
+        }
 
-        st.markdown("### 📈 True Revenue vs. Competitor MCA Debits Comparison")
-        if not df_breakdown.empty:
-            chart_df = df_breakdown.set_index("Month")[["True Revenue ($)", "MCA Debits ($)"]]
-            st.bar_chart(chart_df)
+        avg_row = {
+            "Month": "Average", "Beginning Date": "", "Ending Date": "",
+            "Starting Balance": df_summary["Starting Balance"].mean(),
+            "# Deposits": df_summary["# Deposits"].mean(),
+            "Total Deposits": df_summary["Total Deposits"].mean(),
+            "# Revenue": df_summary["# Revenue"].mean(),
+            "Total Revenue (Excluding Transfers)": df_summary["Total Revenue (Excluding Transfers)"].mean(),
+            "# Non Revenue": df_summary["# Non Revenue"].mean(),
+            "Total Non Revenue": df_summary["Total Non Revenue"].mean(),
+            "# Withdrawals": df_summary["# Withdrawals"].mean(),
+            "Total Withdrawals": df_summary["Total Withdrawals"].mean(),
+            "# Loan Debits": df_summary["# Loan Debits"].mean(),
+            "Loan Debits": df_summary["Loan Debits"].mean(),
+            "Ending Balance": df_summary["Ending Balance"].mean(),
+            "Average Balance": df_summary["Average Balance"].mean(),
+            "# Negative Balance Days": df_summary["# Negative Balance Days"].mean(),
+            "# NSF": df_summary["# NSF"].mean()
+        }
 
-            st.markdown("#### 💡 Monthly MCA Competitor Debt Ratio Breakdown")
-            m_cols = st.columns(min(len(df_breakdown), 6))
-            for idx, row in df_breakdown.iterrows():
-                with m_cols[idx % len(m_cols)]:
-                    st.metric(
-                        label=f"{row['Month']} MCA Debt %",
-                        value=f"{row['MCA Debt %']:.1f}%",
-                        delta=f"${row['MCA Debits ($)']:,.2f} MCA Debits",
-                        delta_color="off"
-                    )
+        df_display = pd.concat([df_summary, pd.DataFrame([total_row, avg_row])], ignore_index=True)
 
-        st.markdown("### 📌 Multi-Month Overview & Averages")
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Active Months", f"{num_active_months} Month(s)")
-        c2.metric("Avg Monthly Deposits", f"${avg_monthly_credits:,.2f}", f"${df_breakdown['Stated Credits ($)'].sum():,.2f} Total")
-        c3.metric("Avg True Monthly Rev", f"${auto_monthly_revenue:,.2f}", f"${df_breakdown['True Revenue ($)'].sum():,.2f} Total")
-        c4.metric("Avg MCA Debt", f"${avg_mca_debits:,.2f} / mo", f"${df_breakdown['MCA Debits ($)'].sum():,.2f} Total")
-        c5.metric("NSF Fees (≥$20)", f"{total_nsf_count} Total", f"{avg_nsf_per_month:.1f} / mo", delta_color="inverse" if total_nsf_count > 0 else "normal")
+        # TABBED VIEW IMPLEMENTATION (MATCHING SCREENSHOT)
+        tab_bank, tab_debt, tab_rev, tab_non_rev, tab_flags = st.tabs([
+            "Bank Statement Summary", "Debt Summary", "Revenue Summary", "Non-Revenue Summary", "Flags"
+        ])
+
+        with tab_bank:
+            st.markdown("### Bank Statement Aggregation Summary")
+            
+            def highlight_totals(s):
+                if s["Month"] in ["TOTAL", "Average"]:
+                    return ['color: red; font-weight: bold;'] * len(s)
+                return [''] * len(s)
+
+            formatted_df = df_display.style.apply(highlight_totals, axis=1).format({
+                "Starting Balance": "${:,.2f}",
+                "# Deposits": "{:,.2f}",
+                "Total Deposits": "${:,.2f}",
+                "# Revenue": "{:,.2f}",
+                "Total Revenue (Excluding Transfers)": "${:,.2f}",
+                "# Non Revenue": "{:,.2f}",
+                "Total Non Revenue": "${:,.2f}",
+                "# Withdrawals": "{:,.2f}",
+                "Total Withdrawals": "${:,.2f}",
+                "# Loan Debits": "{:,.2f}",
+                "Loan Debits": "${:,.2f}",
+                "Ending Balance": "${:,.2f}",
+                "Average Balance": "${:,.2f}",
+                "# Negative Balance Days": "{:,.2f}",
+                "# NSF": "{:,.2f}"
+            })
+            st.dataframe(formatted_df, use_container_width=True, hide_index=True)
+
+        with tab_debt:
+            st.markdown("### 💳 Classified Debt & MCA Loan Debits Bucket")
+            debt_tx = edited_df[edited_df["Category"].str.contains("MCA Debt", na=False)]
+            m_filter = st.multiselect("Filter by Month:", options=edited_df["Month"].unique(), key="debt_m_filter")
+            if m_filter:
+                debt_tx = debt_tx[debt_tx["Month"].isin(m_filter)]
+            st.dataframe(debt_tx.style.format({"Amount ($)": "${:,.2f}"}), use_container_width=True, hide_index=True)
+
+        with tab_rev:
+            st.markdown("### 🟢 Operational Revenue Bucket")
+            rev_tx = edited_df[edited_df["Category"] == "Operational Revenue"]
+            m_filter_r = st.multiselect("Filter by Month:", options=edited_df["Month"].unique(), key="rev_m_filter")
+            if m_filter_r:
+                rev_tx = rev_tx[rev_tx["Month"].isin(m_filter_r)]
+            st.dataframe(rev_tx.style.format({"Amount ($)": "${:,.2f}"}), use_container_width=True, hide_index=True)
+
+        with tab_non_rev:
+            st.markdown("### 🛑 Non-Revenue Exclusions Bucket")
+            non_rev_tx = edited_df[edited_df["Category"] == "Non-Revenue Exclusion"]
+            m_filter_nr = st.multiselect("Filter by Month:", options=edited_df["Month"].unique(), key="non_rev_m_filter")
+            if m_filter_nr:
+                non_rev_tx = non_rev_tx[non_rev_tx["Month"].isin(m_filter_nr)]
+            st.dataframe(non_rev_tx.style.format({"Amount ($)": "${:,.2f}"}), use_container_width=True, hide_index=True)
+
+        with tab_flags:
+            st.markdown("### ⚠️ NSF & Negative Balance Flags")
+            flag_tx = edited_df[edited_df["Category"] == "NSF / Overdraft Fee"]
+            st.dataframe(flag_tx.style.format({"Amount ($)": "${:,.2f}"}), use_container_width=True, hide_index=True)
 
 st.divider()
 
@@ -452,15 +524,16 @@ existing_dsr = (total_existing_monthly_debt / avg_monthly_rev) if avg_monthly_re
 risk_reasons = []
 risk_multiplier = 1.0
 
-if 'avg_nsf_per_month' in locals():
-    if avg_nsf_per_month > 3.0:
-        risk_multiplier *= 0.70
-        risk_reasons.append(f"NSF Fee Risk: High ({total_nsf_count} total ≥$20, {avg_nsf_per_month:.1f}/mo — 30% penalty)")
-    elif avg_nsf_per_month > 1.0:
-        risk_multiplier *= 0.85
-        risk_reasons.append(f"NSF Fee Risk: Moderate ({total_nsf_count} total ≥$20, {avg_nsf_per_month:.1f}/mo — 15% penalty)")
-    else:
-        risk_reasons.append(f"NSF Fee Risk: Clean Record ({total_nsf_count} total fees ≥$20 — No penalty)")
+avg_nsf_per_month = (total_nsf_count / num_active_months) if 'num_active_months' in locals() else 0.0
+
+if avg_nsf_per_month > 3.0:
+    risk_multiplier *= 0.70
+    risk_reasons.append(f"NSF Fee Risk: High ({total_nsf_count} total ≥$20, {avg_nsf_per_month:.1f}/mo — 30% penalty)")
+elif avg_nsf_per_month > 1.0:
+    risk_multiplier *= 0.85
+    risk_reasons.append(f"NSF Fee Risk: Moderate ({total_nsf_count} total ≥$20, {avg_nsf_per_month:.1f}/mo — 15% penalty)")
+else:
+    risk_reasons.append(f"NSF Fee Risk: Clean Record ({total_nsf_count} total fees ≥$20 — No penalty)")
 
 if credit_score < 580:
     risk_multiplier *= 0.65
