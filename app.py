@@ -5,7 +5,6 @@ import pdfplumber
 import io
 from collections import defaultdict
 from datetime import datetime
-import dateparser
 
 st.set_page_config(page_title="Forward Funding MCA Pricing Tool", page_icon="💳", layout="wide")
 
@@ -61,18 +60,19 @@ FR_EN_MONTHS = {
     "JUILLET": "JUL", "JUIL": "JUL", "AOÛT": "AUG", "AOUT": "AUG", "SEPTEMBRE": "SEP", 
     "SEPT": "SEP", "OCTOBRE": "OCT", "NOVEMBRE": "NOV", "DÉCEMBRE": "DEC", "DECEMBRE": "DEC"
 }
-
-MONTHS_ALL = sorted(list(set(list(FR_EN_MONTHS.keys()) + ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"])), key=len, reverse=True)
+MONTHS_ALL = ["JANVIER", "JANV", "FÉVRIER", "FEVRIER", "FEV", "MARS", "AVRIL", "MAI", "JUIN", "JUILLET", "JUIL", "AOÛT", "AOUT", "SEPTEMBRE", "SEPT", "OCTOBRE", "NOVEMBRE", "DÉCEMBRE", "DECEMBRE", "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
 MONTHS_REGEX = r"(?:" + "|".join(MONTHS_ALL) + r")"
 
-# Enhanced Universal Date Pattern (Supports numeric dates like MM/DD, DD/MM, YYYY/MM/DD)
-DATE_PATTERN = rf"\b(?:(\d{{1,2}})[/.-](\d{{1,2}})(?:[/.-](\d{{2,4}}))?|(\d{{1,2}})\s*({MONTHS_REGEX})|({MONTHS_REGEX})\s*(\d{{1,2}}))\b"
-AMOUNT_PATTERN = r"(?<!\d)(?:-?\d{1,3}(?:[ \xA0,]\d{3})+|-?\d+)[.,]\d{2}(?!\d)"
+# Strict Alpha-Numeric Date Matcher (Prevents random IDs from becoming dates)
+DATE_PATTERN = r"(?:^|\s|\b)(?:(\d{1,2})[\s-]*(" + MONTHS_REGEX + r")(?:[\s-]*(\d{2,4}))?|(" + MONTHS_REGEX + r")[\s-]*(\d{1,2})(?:[\s-]*(\d{2,4}))?)(?=\s|$|\b)"
+
+# Amount Pattern properly handling -$515.82 and (515.82)
+AMOUNT_PATTERN = r"(?<!\d)(?:-[\s\$]*|\$[\s-]*|\()?(?:\d{1,3}(?:[ \xA0,]\d{3})+|\d+)[.,]\d{2}\)?(?!\d)"
 
 def parse_amount(amt_str):
-    amt_str = re.sub(r"[\s\xA0]", "", amt_str)
-    is_negative = '-' in amt_str
-    amt_str = amt_str.replace('-', '')
+    is_negative = '-' in amt_str or '(' in amt_str
+    amt_str = re.sub(r"[^\d.,]", "", amt_str)
+    if not amt_str: return 0.0
     if len(amt_str) >= 3 and amt_str[-3] in '.,':
         sep = amt_str[-3]
         if sep == ',': 
@@ -85,8 +85,7 @@ def parse_amount(amt_str):
     return -val if is_negative else val
 
 def extract_universal_lines(page):
-    """Dynamically scales vertical tolerance and falls back to standard text extraction if visual clustering fails."""
-    words = page.extract_words(x_tolerance=2, y_tolerance=4)
+    words = page.extract_words(x_tolerance=3, y_tolerance=5)
     if not words: 
         return [line for line in page.extract_text().split('\n') if line.strip()]
     
@@ -94,7 +93,7 @@ def extract_universal_lines(page):
     for word in words:
         placed = False
         for cluster in clusters:
-            if abs(word['top'] - cluster[0]['top']) < 6: # Increased tolerance to 6pts
+            if abs(word['top'] - cluster[0]['top']) < 6: 
                 cluster.append(word)
                 placed = True
                 break
@@ -110,10 +109,8 @@ def extract_universal_lines(page):
         last_x1 = cluster[0]['x0']
         for w in cluster:
             gap = w['x0'] - last_x1
-            if gap > 12: 
-                line_str += "  " 
-            elif gap > 0:
-                line_str += " "
+            if gap > 12: line_str += "  " 
+            elif gap > 0: line_str += " "
             line_str += w['text']
             last_x1 = w['x1']
         lines.append(line_str.strip())
@@ -124,6 +121,8 @@ def parse_universal_ledger(files_data):
     raw_transactions = []
     warnings = []
     stated_closing_balances = {}
+    absolute_starting_balance = 0.0
+    start_balance_found = False
     
     for file_name, file_bytes in files_data:
         try:
@@ -134,130 +133,168 @@ def parse_universal_ledger(files_data):
                 doc_years = sorted(list(set([int(y) for y in year_matches])))
                 inferred_year = doc_years[-1] if doc_years else datetime.now().year
                 
-                has_dec = bool(re.search(r"\b(?:DEC|DÉC|12/)", full_raw_text))
-                has_jan = bool(re.search(r"\b(?:JAN|01/)", full_raw_text))
+                has_dec = bool(re.search(r"\b(?:DEC|DÉC)", full_raw_text))
+                has_jan = bool(re.search(r"\b(?:JAN)", full_raw_text))
                 
                 last_balance = None
+                current_tx = None
+                pending_desc = ""
+                last_date = None
                 
                 for page in pdf.pages:
                     lines = extract_universal_lines(page)
                     for line in lines:
                         u_line = line.upper()
 
-                        u_line = re.sub(rf"(?<!\s)(\d{{1,2}})({MONTHS_REGEX})\b", r" \1 \2", u_line)
-                        u_line = re.sub(rf"\b({MONTHS_REGEX})(\d{{1,2}})(?!\s)", r"\1 \2 ", u_line)
+                        if any(kw in u_line for kw in ["BALANCE FORWARD", "STARTING BALANCE", "OPENING BALANCE"]):
+                            amts = re.findall(AMOUNT_PATTERN, u_line)
+                            if amts and not start_balance_found:
+                                absolute_starting_balance = parse_amount(amts[-1])
+                                start_balance_found = True
+                            continue
 
                         if any(kw in u_line for kw in ["ENDING BALANCE", "SOLDE FINAL", "CLOSING BALANCE", "NEW BALANCE"]):
                             amts = re.findall(AMOUNT_PATTERN, u_line)
-                            if amts:
-                                stated_bal = parse_amount(amts[-1])
-                                stated_closing_balances[file_name] = stated_bal
+                            if amts: stated_closing_balances[file_name] = parse_amount(amts[-1])
                             continue
                             
                         if any(kw in u_line for kw in ["BALANCE", "SOLDE", "TOTAL", "PAGE", "SUMMARY", "OVERVIEW"]):
                             continue
 
-                        date_match = re.search(DATE_PATTERN, u_line)
-                        if not date_match:
-                            continue
+                        date_match = re.search(DATE_PATTERN, u_line, re.IGNORECASE)
                         
-                        raw_date_str = date_match.group(0)
-                        tx_year = inferred_year
+                        line_no_date = u_line
+                        if date_match:
+                            line_no_date = u_line[:date_match.start()] + " " + u_line[date_match.end():]
+                            
+                        amts = re.findall(AMOUNT_PATTERN, line_no_date)
                         
-                        try:
-                            # Handle numeric dates vs alphabetical dates
-                            if date_match.group(1): # Numeric MM/DD or DD/MM
-                                p1, p2 = int(date_match.group(1)), int(date_match.group(2))
-                                month_val = p1 if p1 <= 12 and p2 > 12 else p2 if p2 <= 12 and p1 > 12 else p1 # Guess MM/DD format
-                                day_val = p2 if month_val == p1 else p1
-                                if date_match.group(3):
-                                    tx_year = int(date_match.group(3))
-                                    if tx_year < 100: tx_year += 2000
-                                parsed_date = datetime(tx_year, month_val, day_val)
-                            else: # Alpha dates
-                                if date_match.group(4):
-                                    day, month = date_match.group(4), date_match.group(5)
+                        # CASE 1: Date found, but no amounts (Multi-line start)
+                        if date_match and not amts:
+                            desc = line_no_date.strip()
+                            pending_desc = desc
+                            
+                            # Parse Date
+                            if date_match.group(1):
+                                day, month, year = date_match.group(1), date_match.group(2), date_match.group(3)
+                            else:
+                                month, day, year = date_match.group(4), date_match.group(5), date_match.group(6)
+                                
+                            month = month.upper()
+                            for fr, en in FR_EN_MONTHS.items():
+                                if month.startswith(fr) or month == fr:
+                                    month = en
+                                    break
+                            month = month[:3]
+                            
+                            if year:
+                                tx_year = int(year) if len(year) == 4 else int("20" + year)
+                            else:
+                                tx_year = inferred_year
+                                if has_dec and has_jan and month == "DEC": tx_year = inferred_year - 1
+                                
+                            try:
+                                last_date = datetime.strptime(f"{tx_year}-{month}-{day.zfill(2)}", "%Y-%b-%d")
+                            except ValueError:
+                                pass
+                                
+                        # CASE 2: Amounts found (New transaction trigger)
+                        elif amts:
+                            if current_tx:
+                                raw_transactions.append(current_tx)
+                                last_balance = current_tx.get('current_bal') or last_balance
+                                
+                            desc = line_no_date
+                            for a in amts: desc = desc.replace(a, "")
+                            desc = desc.strip()
+                            
+                            full_desc = (pending_desc + " " + desc).strip()
+                            pending_desc = ""
+                            
+                            if date_match:
+                                if date_match.group(1):
+                                    day, month, year = date_match.group(1), date_match.group(2), date_match.group(3)
                                 else:
-                                    month, day = date_match.group(6), date_match.group(7)
+                                    month, day, year = date_match.group(4), date_match.group(5), date_match.group(6)
                                     
+                                month = month.upper()
                                 for fr, en in FR_EN_MONTHS.items():
                                     if month.startswith(fr) or month == fr:
                                         month = en
                                         break
-                                month = month[:3].capitalize()
+                                month = month[:3]
                                 
-                                if has_dec and has_jan and month.upper() == "DEC":
-                                    tx_year = inferred_year - 1
-                                parsed_date = datetime.strptime(f"{tx_year}-{month}-{day.zfill(2)}", "%Y-%b-%d")
-                        except ValueError:
-                            continue
-
-                        line_no_date = u_line[:date_match.start()] + " " + u_line[date_match.end():]
-                        amts = re.findall(AMOUNT_PATTERN, line_no_date)
-                        if not amts:
-                            continue
+                                if year:
+                                    tx_year = int(year) if len(year) == 4 else int("20" + year)
+                                else:
+                                    tx_year = inferred_year
+                                    if has_dec and has_jan and month == "DEC": tx_year = inferred_year - 1
+                                    
+                                try:
+                                    last_date = datetime.strptime(f"{tx_year}-{month}-{day.zfill(2)}", "%Y-%b-%d")
+                                except ValueError:
+                                    pass
+                                    
+                            if not last_date: continue 
                             
-                        tx_amt = parse_amount(amts[0])
-                        desc = u_line.replace(raw_date_str, "").replace(amts[0], "").strip()[:80]
-                        
-                        is_credit = None
-                        current_bal = None
-                        
-                        if len(amts) >= 2:
-                            current_bal = parse_amount(amts[-1])
-                            if last_balance is not None:
+                            tx_amt = parse_amount(amts[0])
+                            current_bal = parse_amount(amts[-1]) if len(amts) >= 2 else None
+                            
+                            is_credit = None
+                            if current_bal is not None and last_balance is not None:
                                 delta = round(current_bal - last_balance, 2)
                                 amt_rounded = round(abs(tx_amt), 2)
-                                if delta == amt_rounded:
-                                    is_credit = True
-                                elif delta == -amt_rounded:
+                                if delta == amt_rounded and amt_rounded != 0: is_credit = True
+                                elif delta == -amt_rounded and amt_rounded != 0: is_credit = False
+                                    
+                            if is_credit is None:
+                                if tx_amt < 0:
                                     is_credit = False
-                        
-                        if is_credit is None:
-                            if tx_amt < 0:
-                                is_credit = False
-                                tx_amt = abs(tx_amt)
-                            else:
-                                strict_credits = ["INS ", "MSP ", "HDC ", "CMS ", "E-TRANSFER", "MOBILE DEPOSIT", "DEPOSIT", "DEPOT", "DÉPÔT", "INCOMING", "RECEPT", "TFR-FR", "RTN ", "REBATE", "PAYROLL", "PAIE", "CREDIT", "REMISE"]
-                                strict_debits = ["NSLSC", "COOPERATORS", "ENMAX", "DIRECT ENERGY", "SEND E-TFR", "WORLDREMIT", "REMITLY", "LOAN", "BPY", "W/D", "FEE", "FRAIS", "NON-TD ATM", "TFR-TO", "RETRAIT", "ACHAT", "PURCHASE", "PAYMENT", "PAIEMENT", "CHQ", "CHEQUE", "WITHDRAWAL"]
-                                
-                                if any(kw in desc for kw in strict_credits):
-                                    is_credit = True
-                                elif any(kw in desc for kw in strict_debits):
-                                    is_credit = False 
                                 else:
-                                    is_credit = False 
+                                    strict_credits = ["INS ", "MSP ", "HDC ", "CMS ", "E-TRANSFER", "DEPOSIT", "DEPOT", "DÉPÔT", "INCOMING", "RECEPT", "TFR-FR", "RTN ", "REBATE", "PAYROLL", "PAIE", "CREDIT"]
+                                    strict_debits = ["NSLSC", "COOPERATORS", "ENMAX", "DIRECT ENERGY", "SEND E-TFR", "WORLDREMIT", "REMITLY", "LOAN", "BPY", "W/D", "FEE", "FRAIS", "NON-TD ATM", "TFR-TO", "RETRAIT", "ACHAT", "PURCHASE", "PAYMENT", "PAIEMENT", "CHQ", "CHEQUE", "WITHDRAWAL", "DEBIT", "PAD-"]
+                                    
+                                    if any(kw in full_desc for kw in strict_credits): is_credit = True
+                                    elif any(kw in full_desc for kw in strict_debits): is_credit = False 
+                                    else: is_credit = False 
 
-                        if current_bal is not None:
-                            last_balance = current_bal
+                            tx_type = "Credit (Deposit)" if is_credit else "Debit (Withdrawal)"
+                            is_etransfer = any(kw in full_desc for kw in ["E-TRANSFER", "E-TFR", "INTERAC", "TFR-FR"]) and is_credit
+                            category = "Operational Revenue" if tx_type == "Credit (Deposit)" else "Standard Operating Expense"
 
-                        tx_type = "Credit (Deposit)" if is_credit else "Debit (Withdrawal)"
-                        is_etransfer = any(kw in desc for kw in ["E-TRANSFER", "E-TFR", "INTERAC", "TFR-FR"]) and is_credit
-                        category = "Operational Revenue" if tx_type == "Credit (Deposit)" else "Standard Operating Expense"
+                            for lender_name, meta in KNOWN_FUNDERS.items():
+                                if any(kw in full_desc for kw in meta["keywords"]):
+                                    if "DÉPÔT" in full_desc or is_credit: continue
+                                    category = f"MCA Debt ({lender_name})"
+                                    break
 
-                        for lender_name, meta in KNOWN_FUNDERS.items():
-                            if any(kw in desc for kw in meta["keywords"]):
-                                if "DÉPÔT" in desc or is_credit:
-                                    continue
-                                category = f"MCA Debt ({lender_name})"
-                                break
+                            if any(kw in full_desc for kw in ["NSF", "RETURNED ITEM", "OVERDRAWN", "FRAIS DE RETOUR"]):
+                                category = "NSF / Overdraft Fee"
+                            elif is_credit and not is_etransfer:
+                                if any(ex in full_desc for ex in REVENUE_EXCLUSIONS):
+                                    category = "Non-Revenue Exclusion"
 
-                        if any(kw in desc for kw in ["NSF", "RETURNED ITEM", "OVERDRAWN", "FRAIS DE RETOUR"]):
-                            category = "NSF / Overdraft Fee"
-                        elif is_credit and not is_etransfer:
-                            if any(ex in desc for ex in REVENUE_EXCLUSIONS):
-                                category = "Non-Revenue Exclusion"
+                            current_tx = {
+                                "Date_Obj": last_date,
+                                "Date": last_date.strftime("%Y-%m-%d"),
+                                "Month_Label": last_date.strftime("%B %Y"),
+                                "Description": full_desc[:150],
+                                "Amount ($)": abs(tx_amt),
+                                "Transaction Type": tx_type,
+                                "Category": category,
+                                "Source File": file_name,
+                                "current_bal": current_bal
+                            }
+                            
+                        # CASE 3: No Date, No Amounts (Continuation of Description)
+                        elif not amts and not date_match:
+                            if current_tx:
+                                current_tx["Description"] = (current_tx["Description"] + " " + u_line.strip())[:150]
+                            else:
+                                pending_desc = (pending_desc + " " + u_line.strip())[:150]
 
-                        raw_transactions.append({
-                            "Date_Obj": parsed_date,
-                            "Date": parsed_date.strftime("%Y-%m-%d"),
-                            "Month_Label": parsed_date.strftime("%B %Y"),
-                            "Description": desc,
-                            "Amount ($)": abs(tx_amt),
-                            "Transaction Type": tx_type,
-                            "Category": category,
-                            "Source File": file_name
-                        })
+                if current_tx:
+                    raw_transactions.append(current_tx)
 
         except Exception as e:
             warnings.append(f"Failed to read {file_name}: {str(e)}")
@@ -269,7 +306,7 @@ def parse_universal_ledger(files_data):
     df_all = df_all.sort_values(by="Date_Obj").drop_duplicates(subset=["Date", "Description", "Amount ($)", "Transaction Type"]).reset_index(drop=True)
 
     month_summary_store = {}
-    running_balance = 0.0 
+    running_balance = absolute_starting_balance 
     
     unique_months = df_all["Month_Label"].unique()
     for idx, m in enumerate(unique_months):
@@ -293,7 +330,7 @@ def parse_universal_ledger(files_data):
         }
         running_balance = end_bal 
 
-    df_display = df_all.drop(columns=["Date_Obj"])
+    df_display = df_all.drop(columns=["Date_Obj", "current_bal"], errors='ignore')
     return month_summary_store, df_display, warnings
 
 # --- SECTION 1: BANK STATEMENT UPLOADER ---
