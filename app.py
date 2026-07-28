@@ -63,17 +63,15 @@ REVENUE_EXCLUSIONS = [
     "VIREMENT ACCÈSD", "VIREMENT ACCESD", "369408 EOP", "AVANCE FONDS"
 ]
 
-# --- ROBUST AMOUNT PARSING ENGINE ---
 AMOUNT_PATTERN = r"(?<!\d)(?:\d{1,3}(?:[ \xA0,]\d{3})+|\d+)[.,]\d{2}(?!\d)"
 
 def parse_amount(amt_str):
-    """Safely converts English/French mixed formatting (e.g. '15 000,00' or '1,500.00') into a float."""
-    amt_str = re.sub(r"[\s\xA0]", "", amt_str) # Strip all layout spaces
+    amt_str = re.sub(r"[\s\xA0]", "", amt_str)
     if len(amt_str) >= 3 and amt_str[-3] in '.,':
         sep = amt_str[-3]
-        if sep == ',': # French Format: 15184,47
+        if sep == ',': 
             amt_str = amt_str.replace('.', '').rsplit(',', 1)[0].replace(',', '') + '.' + amt_str[-2:]
-        else: # English Format: 15,184.47
+        else: 
             amt_str = amt_str.replace(',', '')
     else:
         amt_str = amt_str.replace(',', '') 
@@ -98,33 +96,25 @@ def parse_uploaded_pdfs(files_data):
                 warnings.append(f"**{file_name}** appears to be an image/scanned PDF without text layers. Please upload native text PDFs.")
                 continue
 
-            full_pdf_upper = full_pdf_text.upper()
+            text_clean = full_pdf_text
+            full_pdf_upper = text_clean.upper()
+
             if "EQUIFAX" in full_pdf_upper or "CREDIT PORTFOLIO INSIGHTS" in full_pdf_upper:
                 warnings.append(f"Skipped non-bank statement: **{file_name}** (Credit Report Detected)")
                 continue
 
-            # PRE-PROCESS: Separate glued dates from amounts (e.g., "203,0003NOV" -> "203,00 03NOV")
-            months_regex = r"(?:JAN|FEB|FEV|MAR|APR|AVR|MAY|MAI|JUN|JUI|JUL|AUG|AOU|SEP|OCT|NOV|DEC)[A-Z]*"
-            date_glue_pattern = rf"(?<!\s)(\d{{2}}\s?{months_regex})"
-            text_clean = re.sub(date_glue_pattern, r" \1", full_pdf_text, flags=re.IGNORECASE)
-
-            # 1. Month/Year & Period Extractor
             month_label = "Unknown Month"
             beg_date, end_date = "N/A", "N/A"
             try:
-                # TD & French generic format matching
-                period_match_fr = re.search(r"(\d{1,2}\s+[a-zA-ZÉéû]{3,9}\s+\d{2,4})\s*-\s*(\d{1,2}\s+[a-zA-ZÉéû]{3,9}\s+\d{2,4})", text_clean)
-                if period_match_fr:
-                    raw_end_str = period_match_fr.group(2).strip()
-                    month_label = raw_end_str
-                    # Attempt standardization for sorting
-                    standardized = raw_end_str.upper()
-                    for fr, en in MONTH_MAP.items():
-                        standardized = standardized.replace(fr, en)
-                    try:
-                        month_label = pd.to_datetime(standardized).strftime("%b %Y")
-                    except Exception:
-                        pass
+                # TD Format Fix: Account for missing hyphens between "From" and "To"
+                period_match_td = re.search(r"Statement From\s*(?:-|To)?\s*\n?\s*([A-Za-z]{3}\s+\d{1,2}/\d{2})\s*-\s*([A-Za-z]{3}\s+\d{1,2}/\d{2})", text_clean, re.IGNORECASE)
+                overview_match = re.search(r"As of\s+([A-Za-z]{3}\s+\d{1,2},?\s+\d{4})", text_clean, re.IGNORECASE)
+                
+                if period_match_td:
+                    raw_end_str = period_match_td.group(2).strip()
+                    month_label = pd.to_datetime(raw_end_str, format="%b %d/%y").strftime("%b %Y")
+                elif overview_match:
+                    month_label = pd.to_datetime(overview_match.group(1)).strftime("%b %Y")
                 else:
                     date_matches = re.findall(r"\b(\d{4}-\d{2}-\d{2})\b", text_clean)
                     if date_matches:
@@ -133,18 +123,17 @@ def parse_uploaded_pdfs(files_data):
             except Exception:
                 month_label = file_name[:15]
 
-            # 2. Extract Balances
-            start_match = re.search(rf"(?:Solde reporté|BALANCE FORWARD)[^\n]*?({AMOUNT_PATTERN})", text_clean, re.IGNORECASE)
+            start_match = re.search(rf"(?:Solde reporté|BALANCE FORWARD|STARTING BALANCE)[^\n]*?({AMOUNT_PATTERN})", text_clean, re.IGNORECASE)
             if start_match:
                 month_summary_store[month_label]["Start Balance"] = parse_amount(start_match.group(1))
 
-            # 3. Line-by-Line Transaction Analysis
             lines = [l.strip() for l in text_clean.split("\n") if l.strip()]
 
             for line in lines:
                 u = line.upper()
 
-                if any(term in u for term in ["SOLDE REPORTÉ", "BALANCE FORWARD", "OPENING BALANCE", "CLOSING BALANCE", "ACCOUNT SUMMARY", "PAGE ", "IMPORTANT:"]):
+                # Guardrail: Exclude all summary, balance, and total rows from being counted as transactions
+                if any(term in u for term in ["SOLDE REPORTÉ", "BALANCE FORWARD", "STARTING BALANCE", "OPENING BALANCE", "CLOSING BALANCE", "ACCOUNT SUMMARY", "PAGE ", "IMPORTANT:", "TOTAL ", "CURRENT BALANCE", "AVAILABLE BALANCE"]):
                     continue
 
                 amts = re.findall(AMOUNT_PATTERN, line)
@@ -158,16 +147,20 @@ def parse_uploaded_pdfs(files_data):
                     month_summary_store[month_label]["Daily Balances"].append(current_bal)
                     month_summary_store[month_label]["End Balance"] = current_bal
 
-                # Robust Credit / Debit Logic Mapping
-                credit_keywords = ["DÉPÔT", "DEPOT", "VIR. INTERAC DE", "VIREMENT INTERAC DE", "DÉPÔT DIRECT", "DEPOT DIRECT", "AVANCE FONDS", "RISTOURNE", "DEPOSIT", "CREDIT", "RECEIVED", "INCOMING", "RECEPT", "REMISE", "RTN"]
-                debit_keywords = ["ENVOI", "RETRAIT", "FRAIS", "CHQ", "CHEQUE", "WITHDRAWAL", "SENT", "PRET", "PAYMENT", "PAIEMENT", "ACHAT"]
+                # Smart Classifier logic for Medical / Standard / Underwriting specific payees
+                strict_debits = ["NSLSC", "EDGE BENEFITS", "COOPERATORS", "ENMAX", "DIRECT ENERGY", "SEND E-TFR", "WORLDREMIT", "REMITLY", "LOAN", "BPY", "W/D", "FEE", "FRAIS", "CAPTL ONE", "NON-TD ATM", "TFR-TO", "_F", "_V"]
+                strict_credits = ["INS", "MSP", "HDC", "CMS", "E-TRANSFER", "MOBILE DEPOSIT", "DEPOSIT", "DEPOT", "DÉPÔT", "INCOMING", "RECEPT", "TFR-FR", "RTN", "REBATE"]
                 
-                is_credit = any(kw in u for kw in credit_keywords)
-                if any(kw in u for kw in debit_keywords):
-                    is_credit = False # Force override if withdrawal indicators are found alongside return/dep indicators
+                is_credit = False
+                if any(kw in u for kw in strict_credits):
+                    is_credit = True
+                
+                # Debit overrides for generic overlaps (e.g. "Cooperators INS" is a premium payment, not a payout)
+                if any(kw in u for kw in strict_debits):
+                    is_credit = False 
 
                 tx_type = "Credit (Deposit)" if is_credit else "Debit (Withdrawal)"
-                is_etransfer = any(kw in u for kw in ["E-TRANSFER", "E-TFR", "INTERAC", "VIR. INTERAC DE", "VRW"]) and is_credit
+                is_etransfer = any(kw in u for kw in ["E-TRANSFER", "E-TFR", "INTERAC", "VIR. INTERAC DE", "VRW", "TFR-FR"]) and is_credit
                 category = "Operational Revenue" if tx_type == "Credit (Deposit)" else "Standard Operating Expense"
 
                 for lender_name, meta in KNOWN_FUNDERS.items():
@@ -221,7 +214,6 @@ if uploaded_files:
         st.warning(f"⚠️ {w}")
 
     if not df_tx.empty:
-        # --- INTERACTIVE TRANSACTION CLASSIFIER ---
         with st.expander("✏️ Interactive Transaction Classifier (Click to Expand)", expanded=False):
             st.caption("Review extracted transaction line items below. Edit classification categories to update underwriting totals dynamically.")
 
@@ -336,7 +328,6 @@ if uploaded_files:
                 "monthly_avg": round(avg_monthly_impact, 2)
             })
 
-        # BUILD TOTAL & AVERAGE ROWS
         total_row = {
             "Month": "TOTAL", "Beginning Date": "", "Ending Date": "",
             "Starting Balance": df_summary["Starting Balance"].sum(),
